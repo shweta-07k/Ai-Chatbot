@@ -1,0 +1,36 @@
+﻿# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# Local runtime/artifacts
+*.log
+*.tmp
+*.temp
+
+# Frontend
+ai-frontend/node_modules/
+ai-frontend/build/
+ai-frontend/.cache/
+
+# OS/Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Optional data/cache
+*.sqlite3
+
+# Local backup/copy
+upload_copy/

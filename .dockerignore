@@ -1,0 +1,17 @@
+﻿# python
+venv/
+__pycache__/
+*.pyc
+
+# frontend deps/cache
+ai-frontend/node_modules/
+ai-frontend/build/
+
+# local env
+.env
+
+# git
+.git/
+
+# misc
+*.log

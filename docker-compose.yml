@@ -1,0 +1,39 @@
+﻿version: "3.9"
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ai-project-api
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      RAG_USE_REDIS: "true"
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:7-alpine
+    container_name: ai-project-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  frontend:
+    build:
+      context: ./ai-frontend
+      dockerfile: Dockerfile
+    container_name: ai-project-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - api
+
+volumes:
+  redis_data:

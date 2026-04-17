@@ -1,0 +1,14 @@
+azure-ai-inference
+python-dotenv
+fastapi
+uvicorn
+motor
+sentence-transformers
+bcrypt
+pymongo
+python-jose[cryptography]
+faiss-cpu
+numpy
+pypdf
+redis
+python-multipart
