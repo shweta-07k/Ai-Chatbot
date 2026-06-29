@@ -38,6 +38,7 @@ upload_copy/
 
 # Local dev scratch
 .pycache_tmp/
+.venv-test-render/
 tcp_test.py
 test_import.py
 test_neo4j_conn.py

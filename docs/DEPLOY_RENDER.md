@@ -127,7 +127,8 @@ Redeploy the **frontend** after changing env vars (static site bakes `REACT_APP_
 | CORS error | Set `CORS_ORIGINS=https://your-frontend.onrender.com` on API |
 | AI not responding | Verify `GITHUB_TOKEN` on API service |
 | DB errors | Check Atlas IP whitelist and `MONGODB_URI` |
-| Build timeout | Retry deploy; Docker + PyTorch is heavy on free tier |
+| Build timeout | Retry deploy; first PyTorch install takes ~10–15 min |
+| `ResolutionImpossible` | Use latest `requirements-render.txt` (slim deps) + redeploy |
 
 ---
 

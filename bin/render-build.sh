@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Render.com build script — installs CPU PyTorch first to avoid OOM/timeouts.
+# Render.com build — staged installs to avoid pip ResolutionImpossible conflicts.
 set -euo pipefail
 
-pip install --upgrade pip setuptools wheel
+python -m pip install --upgrade "pip>=24,<26" "setuptools>=70,<82" wheel
 
 echo "Installing CPU-only PyTorch..."
-pip install --no-cache-dir "torch==2.11.0" --index-url https://download.pytorch.org/whl/cpu
+python -m pip install --no-cache-dir "torch==2.11.0" --index-url https://download.pytorch.org/whl/cpu
 
 echo "Installing application dependencies..."
-pip install --no-cache-dir -r requirements-render.txt
+python -m pip install --no-cache-dir -r requirements-render.txt
 
 echo "Render build complete."
