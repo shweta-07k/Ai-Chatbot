@@ -1,21 +1,28 @@
 ﻿# python
 venv/
+.venv/
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
 
-# frontend deps/cache
-ai-frontend/node_modules/
-ai-frontend/build/
+# frontend (not needed for API image)
+ai-frontend/
 
 # local env
 .env
+.env.*
 
 # local caches / temp
 .pycache_tmp/
-ai-frontend/build-check/
-
-# git
-.git/
-
-# misc
 *.log
+docs/
+.git/
+.gitignore
+
+# dev scratch
+tcp_test.py
+test_*.py
+tmp_*.py

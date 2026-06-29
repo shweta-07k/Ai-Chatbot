@@ -1,18 +1,25 @@
-﻿FROM python:3.12-slim
+﻿FROM python:3.11-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PIP_DEFAULT_TIMEOUT=300
+ENV PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
 
-COPY requirements.txt /app/requirements.txt
+# faiss-cpu needs libgomp on slim images
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install CPU-only PyTorch first (much smaller/faster than the default torch wheel).
-RUN pip install --no-cache-dir torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu \
-    && pip install --no-cache-dir -r /app/requirements.txt
+COPY requirements-render.txt /app/requirements-render.txt
+COPY bin/render-build.sh /app/bin/render-build.sh
+RUN chmod +x /app/bin/render-build.sh && bash /app/bin/render-build.sh
 
-COPY . /app
+COPY main.py app.py /app/
+COPY rag_prod/ /app/rag_prod/
+COPY rag/ /app/rag/
+COPY db/ /app/db/
 
 EXPOSE 8000
 CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]

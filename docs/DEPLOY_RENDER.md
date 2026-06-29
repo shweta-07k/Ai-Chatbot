@@ -40,7 +40,23 @@ This guide deploys **two Render services** from your GitHub repo:
    - `MONGODB_URI`
    - `GITHUB_TOKEN`
    - `GOOGLE_CLIENT_ID` (optional)
-6. Click **Apply** and wait for builds (API Docker build may take 10–20 minutes first time).
+6. Click **Apply** and wait for builds (API first build may take 10–15 minutes).
+
+### If `nova-ai-api` failed with Docker
+
+The repo now uses **Python native runtime** (not Docker) for the API — more reliable on Render free tier.
+
+**Fix an existing failed API service:**
+
+1. Render Dashboard → **nova-ai-api** → **Settings**
+2. Change **Environment** from Docker to **Python 3**
+3. Set:
+   - **Build command:** `bash bin/render-build.sh`
+   - **Start command:** `uvicorn main:app --host 0.0.0.0 --port $PORT`
+   - **Health check path:** `/health`
+4. **Manual Deploy** → Deploy latest commit
+
+Or delete the API service and re-run the Blueprint from the latest `main` branch.
 
 ---
 
@@ -80,8 +96,9 @@ Redeploy the **frontend** after changing env vars (static site bakes `REACT_APP_
 ### API (Web Service)
 
 - **Root directory:** `.` (repo root)
-- **Environment:** Docker
-- **Dockerfile path:** `./Dockerfile`
+- **Environment:** Python 3 (not Docker)
+- **Build command:** `bash bin/render-build.sh`
+- **Start command:** `uvicorn main:app --host 0.0.0.0 --port $PORT`
 - **Health check path:** `/health`
 - **Env vars:** see `.env.example`
 

@@ -4,10 +4,10 @@
 services:
   - type: web
     name: nova-ai-api
-    runtime: docker
-    dockerfilePath: ./Dockerfile
-    dockerContext: .
+    runtime: python
     plan: free
+    buildCommand: bash bin/render-build.sh
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
       - key: MONGODB_URI
@@ -26,6 +26,8 @@ services:
         value: "1"
       - key: CORS_ORIGIN_REGEX
         value: https://.*\.onrender\.com
+      - key: PYTHON_VERSION
+        value: 3.11.11
 
   - type: web
     name: nova-ai-frontend
