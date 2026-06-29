@@ -1,0 +1,42 @@
+# Render Blueprint — Nova AI Chatbot
+# Dashboard: https://dashboard.render.com/ → New → Blueprint → connect GitHub repo
+
+services:
+  - type: web
+    name: nova-ai-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: MONGODB_URI
+        sync: false
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: JWT_SECRET_KEY
+        generateValue: true
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: NEO4J_ENABLED
+        value: "false"
+      - key: RAG_USE_REDIS
+        value: "false"
+      - key: ALLOW_MODEL_DOWNLOAD
+        value: "1"
+      - key: CORS_ORIGIN_REGEX
+        value: https://.*\.onrender\.com
+
+  - type: web
+    name: nova-ai-frontend
+    runtime: static
+    rootDir: ai-frontend
+    buildCommand: npm install && npm run build
+    staticPublishPath: build
+    pullRequestPreviewsEnabled: true
+    envVars:
+      - key: REACT_APP_API_URL
+        fromService:
+          type: web
+          name: nova-ai-api
+          envVarKey: RENDER_EXTERNAL_URL

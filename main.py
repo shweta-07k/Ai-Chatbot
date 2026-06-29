@@ -684,7 +684,7 @@ _cors_origins = [
 ]
 _cors_origin_regex = os.getenv(
     "CORS_ORIGIN_REGEX",
-    r"https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?",
+    r"https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?|https://.*\.onrender\.com",
 )
 app.add_middleware(
     CORSMiddleware,
