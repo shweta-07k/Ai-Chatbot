@@ -10,6 +10,10 @@ ai-frontend/build/
 # local env
 .env
 
+# local caches / temp
+.pycache_tmp/
+ai-frontend/build-check/
+
 # git
 .git/
 

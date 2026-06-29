@@ -21,6 +21,7 @@ __pycache__/
 # Frontend
 ai-frontend/node_modules/
 ai-frontend/build/
+ai-frontend/build-check/
 ai-frontend/.cache/
 
 # OS/Editor
@@ -34,3 +35,11 @@ Thumbs.db
 
 # Local backup/copy
 upload_copy/
+
+# Local dev scratch
+.pycache_tmp/
+tcp_test.py
+test_import.py
+test_neo4j_conn.py
+test_neo4j_modes.py
+tmp_*.py
