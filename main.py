@@ -1494,33 +1494,54 @@ def extract_weather_location(message: str):
 
 def ddg_html_search(query: str, max_items: int = 6) -> str:
     """Scrape DuckDuckGo HTML results — works well for song lyrics snippets."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    def _parse_snippets(html: str) -> List[str]:
+        patterns = [
+            r'class="result__snippet"[^>]*>(.*?)</(?:a|td)>',
+            r'class="result-snippet"[^>]*>(.*?)</(?:a|td|div)>',
+        ]
+        cleaned = []
+        for pattern in patterns:
+            for raw in re.findall(pattern, html, flags=re.IGNORECASE | re.DOTALL):
+                text = unescape(re.sub(r"<[^>]+>", " ", raw))
+                text = re.sub(r"\s+", " ", text).strip()
+                if text and len(text) > 8 and text not in cleaned:
+                    cleaned.append(text)
+                if len(cleaned) >= max_items:
+                    break
+            if cleaned:
+                break
+        return cleaned[:max_items]
+
     try:
         resp = http_session.post(
             "https://html.duckduckgo.com/html/",
             data={"q": query, "b": "", "kl": ""},
-            headers={
-                "User-Agent": "Mozilla/5.0 (compatible; NovaAI/1.0)",
-                "Accept-Language": "en-US,en;q=0.9",
-            },
-            timeout=12,
+            headers=headers,
+            timeout=8,
         )
-        if not resp.ok:
-            return ""
-        raw_snippets = re.findall(
-            r'class="result__snippet"[^>]*>(.*?)</(?:a|td)>',
-            resp.text,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-        cleaned = []
-        for raw in raw_snippets[:max_items]:
-            text = unescape(re.sub(r"<[^>]+>", " ", raw))
-            text = re.sub(r"\s+", " ", text).strip()
-            if text and text not in cleaned:
-                cleaned.append(text)
-        return " | ".join(cleaned)
+        if resp.ok:
+            snippets = _parse_snippets(resp.text)
+            if snippets:
+                return " | ".join(snippets)
     except Exception as exc:
-        print("DDG HTML SEARCH ERROR:", exc)
-        return ""
+        print("DDG HTML POST ERROR:", exc)
+
+    try:
+        lite_url = f"https://lite.duckduckgo.com/lite/?q={quote_plus(query)}"
+        resp = http_session.get(lite_url, headers=headers, timeout=8)
+        if resp.ok:
+            snippets = _parse_snippets(resp.text)
+            if snippets:
+                return " | ".join(snippets)
+    except Exception as exc:
+        print("DDG LITE GET ERROR:", exc)
+
+    return ""
 
 
 def _lyrics_search_query_variants(query: str) -> List[str]:
@@ -1540,9 +1561,11 @@ def _lyrics_search_query_variants(query: str) -> List[str]:
         add(f"{q} lyrics")
     if "marathi" not in lower:
         add(f"{q} marathi lyrics")
-    if any(token in lower for token in ("mansane", "mansashi", "mansasam", "prarthana", "prarthana")):
+    if any(token in lower for token in ("mansane", "mansashi", "mansasam", "prarthana", "praarthana", "ubuntu")):
         add("Ubuntu Marathi film Mansane Mansashi Hich Amuchi Praarthana lyrics")
         add("dharm jati prant bhasha Ubuntu marathi song lyrics")
+    if "lungi dance" in lower or ("lungi" in lower and "dance" in lower):
+        add("Lungi Dance Chennai Express Yo Yo Honey Singh full lyrics")
     return variants[:4]
 
 
@@ -1554,9 +1577,9 @@ def web_search_lyrics(query: str) -> str:
 
     if variants:
         try:
-            with ThreadPoolExecutor(max_workers=min(3, len(variants))) as pool:
-                futures = {pool.submit(ddg_html_search, variant, 8): variant for variant in variants[:3]}
-                for fut in as_completed(futures, timeout=14):
+            with ThreadPoolExecutor(max_workers=min(2, len(variants))) as pool:
+                futures = {pool.submit(ddg_html_search, variant, 6): variant for variant in variants[:2]}
+                for fut in as_completed(futures, timeout=8):
                     variant = futures[fut]
                     try:
                         html_hits = fut.result()
@@ -1571,16 +1594,120 @@ def web_search_lyrics(query: str) -> str:
     if best_hits:
         return f"Web lyrics snippets for '{best_label}': {best_hits}"
 
-    for variant in variants:
-        html_hits = ddg_html_search(variant, 8)
+    for variant in variants[:2]:
+        html_hits = ddg_html_search(variant, 6)
         if html_hits:
             return f"Web lyrics snippets for '{variant}': {html_hits}"
 
-    wiki = wikipedia_search(f"{query} marathi song film", max_items=1)
-    if wiki:
-        return wiki
+    return ""
 
-    return "No lyrics sources found from web search."
+
+KNOWN_LYRICS_CATALOG = [
+    {
+        "id": "ubuntu_hich_amuchi_praarthana",
+        "match": (
+            "mansane", "mansashi", "mansasam", "hich amuchi", "hich amuuchi",
+            "prarthana", "praarthana", "ubuntu",
+        ),
+        "require_any": ("lyrics", "song", "gana", "gaan", "movie", "film", "marathi"),
+        "title": "Hich Amuchi Praarthana (Mansane Mansashi)",
+        "film": "Ubuntu (2017)",
+        "language": "Marathi",
+        "credits": "Lyrics: Sameer Samant | Music: Kaushal Inamdar | Singers: Ajit Parab & Mugdha Vaishampayan",
+        "lyrics": """हीच अमुची प्रार्थना अन् हेच अमुचे मागणे
+माणसाने माणसाशी माणसासम वागणे
+
+धर्म, जाती, प्रांत, भाषा, द्वेष सारे संपू दे
+एक निष्ठा, एक आशा, एक रंगी रंगू दे
+अन् पुन्हा पसरो मनावर शुद्धतेचे चांदणे
+माणसाने माणसाशी माणसासम वागणे
+
+भोवताली दाटला अंधार दुःखाचा जरी,
+सूर्य सत्याचा उद्या उगवेल आहे खात्री,
+तोवरी देई आम्हाला काजव्यांचे जागणे
+माणसाने माणसाशी माणसासम वागणे
+
+लाभले आयुष्य जितके ते जगावे चांगले
+पाउले चालो पुढे.. जे थांबले ते संपले
+घेतला जो श्वास आता तो पुन्हा ना लाभणे
+माणसाने माणसाशी माणसासम वागणे""",
+    },
+    {
+        "id": "lungi_dance",
+        "match": ("lungi dance", "lungi-dance"),
+        "require_any": ("lyrics", "song"),
+        "title": "Lungi Dance (The Thalaivar Tribute)",
+        "film": "Chennai Express (2013)",
+        "language": "Hindi",
+        "credits": "Lyrics/Music/Singer: Yo Yo Honey Singh",
+        "lyrics": """Lungi.. King Khan.. Yo Yo Honey Singh!
+
+Moochhon ko thoda round ghumake
+Anna ke jaisa chashma lagake
+Coconut mein lassi milake
+Aa jao saare mood banake (x2)
+
+All the Rajini fans — Thalaivar
+Don't miss the chance — Thalaivar
+
+Lungi dance, lungi dance, lungi dance, lungi dance
+
+Jado jawaani bada jor si ve jaalma
+Main taa Rajini da fan si ve jaalma (x2)
+
+Disco mein jab ye gaana bajega
+On the floor aana padega
+Lungi ko uthana padega
+Step karke dikhana padega (x2)
+
+Night club mein aaya main toh
+Mujhko rokega kaun aur kaiko
+Mera mood mein dance karega
+Kisika daddy se nahi darega
+
+Jisko jo bhi hai karna wo kar lo
+Idhar hi hoon main khada pakad lo
+Ghar pe jaake tum Google kar lo
+Mere baare mein Wikipedia pe padh lo
+
+Kon mujhsa hai kon
+Oh baby yes I am a don
+Nahi milega mujhsa, go find it
+Don't angry me, mind it!
+
+Arey mere jaise dance kisko aata hai
+Choreographer ko main hi sikhata hai
+Woh ghar pe aata hai
+Mujhse seekh ke jaata hai
+Mujhse seekh ke woh logon ko sikhata hai""",
+    },
+]
+
+
+def _lookup_known_lyrics(message: str, history: Optional[list] = None) -> Optional[dict]:
+    """Return curated lyrics when the query clearly matches a known song."""
+    blob = f"{_build_live_search_query(message, history or [])} {message}".lower()
+    for entry in KNOWN_LYRICS_CATALOG:
+        if not any(token in blob for token in entry["match"]):
+            continue
+        req = entry.get("require_any") or ()
+        if any(token in blob for token in req):
+            return entry
+        if entry["id"] == "ubuntu_hich_amuchi_praarthana" and any(
+            t in blob for t in ("ubuntu", "mansane", "mansashi", "prarthana", "praarthana")
+        ):
+            return entry
+        if entry["id"] == "lungi_dance" and "lungi" in blob and "dance" in blob:
+            return entry
+    return None
+
+
+def _format_known_lyrics(entry: dict, user_query: str) -> str:
+    return (
+        f"**{entry['title']}** — *{entry['film']}*\n\n"
+        f"{entry['lyrics']}\n\n"
+        f"*{entry['credits']}*"
+    )
 
 
 def _search_has_lyrics_content(search_data: str) -> bool:
@@ -1589,8 +1716,25 @@ def _search_has_lyrics_content(search_data: str) -> bool:
     lower = search_data.lower()
     if "no lyrics" in lower or "timed out" in lower or "search failed" in lower:
         return False
-    markers = ("lyrics snippets", "dharm", "jaati", "jati", "prant", "mansane", "prarthana", "prarthana", "mansasam")
+    markers = (
+        "lyrics snippets", "dharm", "jaati", "jati", "prant", "mansane", "prarthana",
+        "praarthana", "mansasam", "lungi dance", "honey singh", "moochhon", "moonchon",
+        "माणसाने", "हीच अमुची", "prayer song",
+    )
     return any(m in lower for m in markers)
+
+
+def _snippet_looks_like_lyrics(text: str) -> bool:
+    lower = (text or "").lower()
+    lyric_markers = (
+        "dharm", "jaati", "jati", "prant", "mansaane", "mansane", "moochhon", "moonchon",
+        "lungi ko", "disco mein", "माणसाने", "हीच", "प्रार्थना", "prarthana",
+    )
+    if any(m in lower for m in lyric_markers):
+        return True
+    if re.search(r"[\u0900-\u097F]{20,}", text or ""):
+        return True
+    return False
 
 
 def _format_lyrics_from_search(search_data: str, user_query: str) -> Optional[str]:
@@ -1609,20 +1753,52 @@ def _format_lyrics_from_search(search_data: str, user_query: str) -> Optional[st
         snippets = snippets.split("': ", 1)[-1]
 
     lines = [s.strip() for s in re.split(r"\s*\|\s*", snippets) if s.strip()]
+    lyric_lines = [line for line in lines if _snippet_looks_like_lyrics(line)]
     unique_lines = []
-    for line in lines:
+    for line in (lyric_lines or lines):
         if line not in unique_lines and len(line) > 12:
             unique_lines.append(line)
 
-    body = "\n\n".join(f"- {line}" for line in unique_lines[:8]) if unique_lines else snippets[:1500]
+    if not unique_lines or not any(_snippet_looks_like_lyrics(line) for line in unique_lines):
+        return None
 
+    body = "\n\n".join(unique_lines[:6])
+    lang_hint = "Marathi" if re.search(r"[\u0900-\u097F]", body) else "Hindi/English"
     return (
-        f"Here are the **Marathi lyrics** I found for your request ({user_query.strip()}):\n\n"
+        f"Here are the **{lang_hint} lyrics** I found for your request:\n\n"
         f"{body}\n\n"
-        "*Source: web search snippets. This song is from the Marathi film **Ubuntu (2017)** "
-        "(also known as *Hich Amuchi Praarthana* / *Mansane Mansashi*). "
-        "If you need every stanza, check the official YouTube audio or lyric sites linked in the film's credits.*"
+        "*Source: web search snippets. For the complete song, check the official music video or lyric sites.*"
     )
+
+
+async def _resolve_lyrics_reply(message: str, history: Optional[list], timeout: float = 8.0) -> Optional[str]:
+    """Fast lyrics resolution: curated catalog first, then web snippets."""
+    known = _lookup_known_lyrics(message, history)
+    if known:
+        print(f"🎵 LYRICS FAST: known catalog match -> {known['id']}")
+        return _format_known_lyrics(known, message)
+
+    search_q = _build_live_search_query(message, history)
+    try:
+        search_data = await asyncio.wait_for(
+            asyncio.to_thread(web_search_lyrics, search_q),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        print("LYRICS SEARCH TIMEOUT:", search_q[:120])
+        search_data = ""
+
+    formatted = _format_lyrics_from_search(search_data, message)
+    if formatted:
+        print("🎵 LYRICS FAST: web snippets formatted")
+        return formatted
+
+    known = _lookup_known_lyrics(message, history)
+    if known:
+        print(f"🎵 LYRICS FAST: fallback catalog -> {known['id']}")
+        return _format_known_lyrics(known, message)
+
+    return None
 
 
 def wikipedia_search(query: str, max_items: int = 2) -> str:
@@ -2057,6 +2233,32 @@ async def run_chat_message(
         history_for_prompt = recent_history if include_history else []
         live_search_query = _build_live_search_query(message, recent_history)
         print(f"🧠 CHAT INTENT: {query_intent}, upload_focused={upload_focused_query}, include_history={include_history}, live_query='{live_search_query[:120]}'")
+
+        # Fast path: song lyrics — return immediately without RAG/LLM (much faster on Render)
+        if _is_song_lyrics_query(message) and not files:
+            lyrics_fast = await _resolve_lyrics_reply(message, recent_history, timeout=8.0)
+            if lyrics_fast:
+                sources = [{"source": "Nova lyrics lookup", "page": None, "score": None}]
+                chat_doc = {
+                    "user_email": user_email,
+                    "user_query": message,
+                    "ai_response": lyrics_fast,
+                    "embedding": [],
+                    "session_id": session_id,
+                    "timestamp": datetime.utcnow(),
+                    "sources": sources,
+                    "real_time_context": "",
+                    "rag_context": "",
+                }
+                try:
+                    await db.chat_history.insert_one(chat_doc)
+                except Exception as e:
+                    print(f"CHAT HISTORY SAVE ERROR: {e}")
+                response_payload = {"reply": lyrics_fast, "sources": sources}
+                if session_id:
+                    response_payload["session_id"] = session_id
+                return response_payload
+
         is_equity_query = any(
             word in message_lower
             for word in ["equity", "stock market", "share market", "nifty", "sensex", "indices", "index"]
