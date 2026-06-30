@@ -408,20 +408,21 @@ def _is_career_interview_query(message: str) -> bool:
     return any(re.search(pattern, lower) for pattern in patterns)
 
 
-def _resolve_query_intent(message: str, has_files: bool) -> str:
+def _resolve_query_intent(message: str, has_files: bool, history: Optional[list] = None) -> str:
     """Classify the current user message so the assistant routes to the right brain."""
+    history = history or []
     if has_files:
         return "upload"
+    if history and (_is_vague_followup(message) or _references_prior_context(message)):
+        return "followup"
     if is_weather_query(message):
         return "weather"
     if _is_career_interview_query(message):
         return "career"
     if _is_upload_focused_query(message, has_files=False):
         return "upload"
-    if needs_live_search(message):
+    if needs_live_search(message) or _is_entertainment_release_query(message):
         return "live"
-    if _references_prior_context(message):
-        return "followup"
     return "general"
 
 
@@ -434,7 +435,8 @@ def _intent_guidance(intent: str) -> str:
         ),
         "followup": (
             "Current question type: follow-up. "
-            "The user is continuing the previous topic — use recent conversation context."
+            "The user is continuing the previous topic — use recent conversation context and any live search data. "
+            "Do not ask them to clarify if the prior turn makes the topic obvious."
         ),
         "upload": (
             "Current question type: uploaded document. "
@@ -446,7 +448,8 @@ def _intent_guidance(intent: str) -> str:
         ),
         "live": (
             "Current question type: live/current information. "
-            "Use the real-time search data provided below."
+            "Use the real-time search data below. Only list names, dates, and facts explicitly supported by that data. "
+            "Do not invent titles or release dates. If results are incomplete, say what is confirmed and what is missing."
         ),
         "career": (
             "Current question type: interview or career advice. "
@@ -456,15 +459,89 @@ def _intent_guidance(intent: str) -> str:
     return notes.get(intent, notes["general"])
 
 
-def _should_include_conversation_history(message: str, intent: str) -> bool:
+def _should_include_conversation_history(message: str, intent: str, history: Optional[list] = None) -> bool:
     """Only keep prior turns when the user is clearly continuing the same topic."""
+    history = history or []
     if intent == "followup" or _references_prior_context(message):
         return True
-    if intent in ("general", "weather", "live", "career"):
+    if history and _is_vague_followup(message):
+        return True
+    if intent in ("general", "weather", "career"):
         return False
+    if intent == "live" and history and len((message or "").split()) <= 8:
+        return True
     if intent == "upload" and not _references_prior_context(message):
         return False
     return False
+
+
+def _is_vague_followup(message: str) -> bool:
+    """Short continuation that only makes sense with prior chat context."""
+    lower = (message or "").lower().strip()
+    if not lower:
+        return False
+    word_count = len(lower.split())
+    if word_count > 10:
+        return False
+    patterns = [
+        r"^(currently|currently released|currently release)\b",
+        r"^(what about now|right now|in theaters|in theatres|in cinema)\b",
+        r"^(this week|this month|today|now)\??$",
+        r"^(and |also |what else|any more|more names|more\??)\b",
+        r"^(which ones|name them|list them|tell me names|those ones)\b",
+        r"^(released|release|releases)\??$",
+        r"^(like what|such as|for example)\??$",
+        r"^(it|that|this|those|these)\??$",
+    ]
+    if any(re.search(pattern, lower) for pattern in patterns):
+        return True
+    if word_count <= 5 and any(
+        term in lower
+        for term in ("released", "release", "current", "currently", "latest", "now", "today", "theater", "theatre")
+    ):
+        return True
+    return False
+
+
+def _is_entertainment_release_query(message: str) -> bool:
+    lower = (message or "").lower()
+    has_entertainment = any(term in lower for term in ENTERTAINMENT_TERMS)
+    has_release_intent = any(
+        term in lower
+        for term in (
+            "latest", "recent", "released", "release", "new", "current", "currently",
+            "now", "today", "this week", "this month", "upcoming", "in theater", "in theatre",
+        )
+    )
+    return has_entertainment and has_release_intent
+
+
+def _build_live_search_query(message: str, history: Optional[list] = None) -> str:
+    """Expand vague follow-ups using the previous user question."""
+    history = history or []
+    message = (message or "").strip()
+    if not message:
+        return message
+
+    year = str(datetime.utcnow().year)
+    if history and (_is_vague_followup(message) or _references_prior_context(message)):
+        prior_queries = [((chat.get("user_query") or "").strip()) for chat in history[-3:] if chat.get("user_query")]
+        prior_text = " ".join(prior_queries).strip()
+        combined = f"{prior_text} {message}".strip()
+        if _is_entertainment_release_query(combined) or _is_entertainment_release_query(prior_text):
+            combined = f"Bollywood Hindi movies currently released in theaters India {year} {combined}"
+        elif year not in combined:
+            combined = f"{combined} {year}"
+        return re.sub(r"\s+", " ", combined).strip()
+
+    if _is_entertainment_release_query(message):
+        return re.sub(
+            r"\s+",
+            " ",
+            f"Bollywood Hindi movies currently released in theaters India {year} {message}",
+        ).strip()
+
+    return message
 
 
 def _looks_like_followup(message: str) -> bool:
@@ -493,6 +570,7 @@ def _references_prior_context(message: str) -> bool:
         r"\b(its|their|his|her)\b",
         r"^(what about|how about)\b",
         r"^(and |also )\b",
+        r"\b(currently released|currently release|in theaters|in theatres)\b",
     ]
     return any(re.search(pattern, lower) for pattern in patterns)
 
@@ -752,10 +830,18 @@ WEATHER_INTENT_TERMS = [
 ]
 
 LIVE_INFO_TERMS = [
-    "current", "today", "now", "latest", "recent", "live", "real time",
+    "current", "currently", "today", "now", "latest", "recent", "live", "real time",
     "breaking", "news", "update", "updates", "price", "prices", "stock",
     "crypto", "score", "match", "result", "results", "headlines", "search",
     "who won", "what happened", "this week", "this month", "this year",
+    "released", "release", "releases", "releasing", "new movie", "new film",
+    "bollywood", "box office", "in theaters", "in theatres", "streaming",
+]
+
+ENTERTAINMENT_TERMS = [
+    "bollywood", "movie", "movies", "film", "films", "cinema", "box office",
+    "hindi film", "hindi movie", "tollywood", "kollywood", "web series",
+    "ott release", "theater", "theatre",
 ]
 
 
@@ -1021,10 +1107,11 @@ def extract_weather_location(message: str):
 
     return None
 
-def web_search(query: str):
+def web_search(query: str, max_items: int = 3):
     """No-key live web/news lookup using free public endpoints."""
     try:
         safe_query = quote_plus(query)
+        item_limit = max(3, min(max_items, 8))
 
         # 1) Google News RSS fallback (no key required)
         rss_url = f"https://news.google.com/rss/search?q={safe_query}"
@@ -1034,7 +1121,7 @@ def web_search(query: str):
             items = root.findall(".//item")
             if items:
                 news_parts = []
-                for item in items[:3]:
+                for item in items[:item_limit]:
                     title = unescape((item.findtext("title") or "Untitled").strip())
                     link = (item.findtext("link") or "").strip()
                     pub = (item.findtext("pubDate") or "").strip()
@@ -1052,7 +1139,7 @@ def web_search(query: str):
                 return f"DuckDuckGo instant result: {abstract} ({abstract_url})"
             related = ddg.get("RelatedTopics") or []
             snippets = []
-            for t in related[:3]:
+            for t in related[:item_limit]:
                 if isinstance(t, dict) and t.get("Text"):
                     snippets.append(t.get("Text"))
             if snippets:
@@ -1362,10 +1449,11 @@ async def run_chat_message(
         direct_sources = []
         generic_document_query = _is_generic_document_query(message) or bool(files)
         upload_focused_query = _is_upload_focused_query(message, has_files=bool(files))
-        query_intent = _resolve_query_intent(message, has_files=bool(files))
-        include_history = _should_include_conversation_history(message, query_intent)
+        query_intent = _resolve_query_intent(message, has_files=bool(files), history=recent_history)
+        include_history = _should_include_conversation_history(message, query_intent, recent_history)
         history_for_prompt = recent_history if include_history else []
-        print(f"🧠 CHAT INTENT: {query_intent}, upload_focused={upload_focused_query}, include_history={include_history}")
+        live_search_query = _build_live_search_query(message, recent_history)
+        print(f"🧠 CHAT INTENT: {query_intent}, upload_focused={upload_focused_query}, include_history={include_history}, live_query='{live_search_query[:120]}'")
         is_equity_query = any(
             word in message_lower
             for word in ["equity", "stock market", "share market", "nifty", "sensex", "indices", "index"]
@@ -1423,8 +1511,16 @@ async def run_chat_message(
                 direct_reply = "Please specify a city/location for live weather, for example: 'weather in Delhi now'."
                 direct_sources = ["Open-Meteo"]
         
-        elif needs_live_search(message) and not real_time_context:
-            search_data = web_search(message)
+        elif needs_live_search(message) or _is_entertainment_release_query(message) or (
+            query_intent == "followup" and recent_history
+        ):
+            search_target = live_search_query or message
+            max_items = 6 if (
+                _is_entertainment_release_query(search_target)
+                or query_intent == "followup"
+                or _is_vague_followup(message)
+            ) else 5
+            search_data = web_search(search_target, max_items=max_items)
             real_time_context = f"\n[{get_current_info()}]\n[Real-time Search Data: {search_data}]"
         
         # Build conversation context
@@ -1433,7 +1529,8 @@ async def run_chat_message(
 Answer the user's question clearly and accurately.
 - You are in a multi-turn chat. Focus on the user's **latest message** and give the answer they expect for that type of question.
 - Switch topics naturally: technology questions, weather, interview advice, and uploaded documents are all handled independently unless the user explicitly continues a prior topic.
-- For related follow-ups (e.g. "tell me more", "what about its hooks"), use prior conversation context.
+- For related follow-ups (e.g. "currently released", "tell me more", "what about now"), use prior conversation context and treat them as the same topic.
+- Never reply with "Could you clarify?" when the previous user message already established the topic (movies, weather, tech, etc.).
 - For new unrelated questions, answer only the new question — do not mix in earlier topics.
 - For general knowledge questions, answer from your own knowledge in helpful Markdown.
 - Wrap shell/terminal commands in inline backticks or fenced ``` code blocks so they are easy to copy.
