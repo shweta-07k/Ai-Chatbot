@@ -891,7 +891,17 @@ def _build_live_search_query(message: str, history: Optional[list] = None) -> st
             query = f"{combined} song lyrics verified"
         return re.sub(r"\s+", " ", query).strip()
 
-    if _is_song_lyrics_query(message) or (prior_text and _is_song_lyrics_query(prior_text)):
+    if _is_song_lyrics_query(message):
+        if history and _is_likely_continuation(message, history):
+            prior_text = " ".join(_prior_user_queries(history, 3)).strip()
+            query = f"{prior_text} {message}".strip()
+        else:
+            query = message
+        if "lyrics" not in query.lower():
+            query = f"{query} lyrics"
+        return re.sub(r"\s+", " ", query).strip()
+
+    if prior_text and _is_song_lyrics_query(prior_text) and history and _is_likely_continuation(message, history):
         query = combined
         if "lyrics" not in query.lower():
             query = f"{query} lyrics"
@@ -1606,10 +1616,9 @@ KNOWN_LYRICS_CATALOG = [
     {
         "id": "ubuntu_hich_amuchi_praarthana",
         "match": (
-            "mansane", "mansashi", "mansasam", "hich amuchi", "hich amuuchi",
+            "mansane", "mansashi", "manasashi", "mansasam", "hich amuchi", "hich amuuchi",
             "prarthana", "praarthana", "ubuntu",
         ),
-        "require_any": ("lyrics", "song", "gana", "gaan", "movie", "film", "marathi"),
         "title": "Hich Amuchi Praarthana (Mansane Mansashi)",
         "film": "Ubuntu (2017)",
         "language": "Marathi",
@@ -1635,7 +1644,6 @@ KNOWN_LYRICS_CATALOG = [
     {
         "id": "lungi_dance",
         "match": ("lungi dance", "lungi-dance"),
-        "require_any": ("lyrics", "song"),
         "title": "Lungi Dance (The Thalaivar Tribute)",
         "film": "Chennai Express (2013)",
         "language": "Hindi",
@@ -1681,24 +1689,90 @@ Woh ghar pe aata hai
 Mujhse seekh ke jaata hai
 Mujhse seekh ke woh logon ko sikhata hai""",
     },
+    {
+        "id": "jana_gana_mana",
+        "match": ("jan gan man", "jana gana mana", "janaganamana", "jana-gana-mana"),
+        "title": "Jana Gana Mana",
+        "film": "National Anthem of India",
+        "language": "Hindi/Sanskrit",
+        "credits": "Lyrics: Rabindranath Tagore | Composer: Rabindranath Tagore",
+        "lyrics": """Jana-gana-mana-adhinayaka jaya he
+Bharata-bhagya-vidhata
+Punjab-Sindhu-Gujarata-Maratha
+Dravida-Utkala-Banga
+Vindhya-Himachala-Yamuna-Ganga
+Uchchhala-jaladhi-taranga
+Tava shubha name jage
+Tava shubha asisha mage
+Gahe tava jaya-gatha
+Jana-gana-mangala-dayaka jaya he
+Bharata-bhagya-vidhata
+Jaya he, jaya he, jaya he
+Jaya jaya jaya, jaya he""",
+    },
 ]
 
 
+def _score_lyrics_catalog_entry(entry: dict, text: str) -> int:
+    """Score how well the current user text matches a catalog song (higher = better)."""
+    lower = (text or "").lower()
+    if not lower:
+        return 0
+
+    score = 0
+    for token in entry["match"]:
+        if " " in token and token in lower:
+            score += 12 + len(token)
+        elif token in lower:
+            score += 5
+
+    if entry["id"] == "lungi_dance":
+        if "lungi dance" in lower or "lungi-dance" in lower:
+            score += 8
+        elif "lungi" in lower and "dance" in lower:
+            score += 6
+        else:
+            return 0
+
+    if entry["id"] == "ubuntu_hich_amuchi_praarthana":
+        strong = ("ubuntu", "mansane", "mansashi", "manasashi", "mansasam", "hich amuchi", "prarthana", "praarthana")
+        if not any(token in lower for token in strong):
+            return 0
+
+    if entry["id"] == "jana_gana_mana":
+        if not any(token in lower for token in entry["match"]):
+            return 0
+
+    return score
+
+
 def _lookup_known_lyrics(message: str, history: Optional[list] = None) -> Optional[dict]:
-    """Return curated lyrics when the query clearly matches a known song."""
-    blob = f"{_build_live_search_query(message, history or [])} {message}".lower()
+    """Return curated lyrics only when the *current* message clearly names the song."""
+    history = history or []
+    current = (message or "").strip()
+    best_entry = None
+    best_score = 0
+
     for entry in KNOWN_LYRICS_CATALOG:
-        if not any(token in blob for token in entry["match"]):
-            continue
-        req = entry.get("require_any") or ()
-        if any(token in blob for token in req):
-            return entry
-        if entry["id"] == "ubuntu_hich_amuchi_praarthana" and any(
-            t in blob for t in ("ubuntu", "mansane", "mansashi", "prarthana", "praarthana")
-        ):
-            return entry
-        if entry["id"] == "lungi_dance" and "lungi" in blob and "dance" in blob:
-            return entry
+        score = _score_lyrics_catalog_entry(entry, current)
+        if score > best_score:
+            best_score = score
+            best_entry = entry
+
+    if best_entry and best_score >= 5:
+        return best_entry
+
+    # Short follow-ups like "full lyrics" or "second stanza" — use the prior song only
+    if history and _is_likely_continuation(current, history):
+        prior_query = (_prior_user_queries(history, 1) or [""])[-1]
+        for entry in KNOWN_LYRICS_CATALOG:
+            score = _score_lyrics_catalog_entry(entry, prior_query)
+            if score > best_score:
+                best_score = score
+                best_entry = entry
+        if best_entry and best_score >= 5:
+            return best_entry
+
     return None
 
 
@@ -1792,11 +1866,6 @@ async def _resolve_lyrics_reply(message: str, history: Optional[list], timeout: 
     if formatted:
         print("🎵 LYRICS FAST: web snippets formatted")
         return formatted
-
-    known = _lookup_known_lyrics(message, history)
-    if known:
-        print(f"🎵 LYRICS FAST: fallback catalog -> {known['id']}")
-        return _format_known_lyrics(known, message)
 
     return None
 
