@@ -300,6 +300,12 @@ export default function ChatApp({ googleEnabled = false }) {
 
     const messageText = question || "Please analyze the attached document(s) and summarize the key information.";
     const filesToSend = [...selectedFiles];
+    const priorConversation = messages
+      .map((m) => ({
+        role: m.role === "ai" ? "assistant" : "user",
+        text: m.text,
+      }))
+      .slice(-10);
 
     setMessages((prev) => {
       const updated = [...prev, {
@@ -342,6 +348,7 @@ export default function ChatApp({ googleEnabled = false }) {
           message: messageText,
           email: user?.email || null,
           session_id: sessionId,
+          conversation: priorConversation,
         });
       }
 

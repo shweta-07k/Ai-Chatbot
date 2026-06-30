@@ -417,6 +417,69 @@ def _prior_user_queries(history: Optional[list], limit: int = 3) -> List[str]:
     ]
 
 
+def _history_from_client_conversation(turns: Optional[list]) -> List[dict]:
+    """Convert frontend message list into the same shape as Mongo chat history."""
+    if not turns:
+        return []
+
+    normalized = []
+    for turn in turns:
+        if not isinstance(turn, dict):
+            continue
+        role = str(turn.get("role") or "").lower()
+        text = (turn.get("text") or turn.get("content") or "").strip()
+        if not text:
+            continue
+        normalized.append(
+            {
+                "role": "assistant" if role in {"ai", "assistant"} else "user",
+                "text": text,
+            }
+        )
+
+    paired: List[dict] = []
+    pending_user = None
+    for item in normalized:
+        if item["role"] == "user":
+            if pending_user:
+                paired.append({"user_query": pending_user, "ai_response": ""})
+            pending_user = item["text"]
+        elif pending_user:
+            paired.append({"user_query": pending_user, "ai_response": item["text"]})
+            pending_user = None
+
+    return paired
+
+
+def _merge_chat_history(mongo_history: Optional[list], client_history: Optional[list]) -> List[dict]:
+    """Use browser conversation when DB history is missing or shorter."""
+    mongo = mongo_history or []
+    client = client_history or []
+    if not client:
+        return mongo
+    if not mongo:
+        return client
+    return client if len(client) > len(mongo) else mongo
+
+
+def _is_local_business_query(message: str) -> bool:
+    lower = (message or "").lower()
+    return any(term in lower for term in LOCAL_BUSINESS_TERMS)
+
+
+def _listing_format_guidance() -> str:
+    return (
+        "When the user asks about hotels, restaurants, classes, courses, coaching, hospitals, "
+        "shops, or other local services, format EACH option like this:\n"
+        "### Place name\n"
+        "- **Address:** full address (or area/city if full address unavailable)\n"
+        "- **Website:** URL from search results when available\n"
+        "- **Phone:** number when available\n"
+        "- **Details:** brief helpful note (timings, fees, rating, etc.)\n"
+        "Include clickable links from search results. Do not invent addresses or phone numbers."
+    )
+
+
 def _prior_was_live_topic(history: Optional[list]) -> bool:
     return any(needs_live_search(q) for q in _prior_user_queries(history, 3))
 
@@ -554,16 +617,21 @@ def _should_include_conversation_history(message: str, intent: str, history: Opt
 def _should_live_search(message: str, history: Optional[list], intent: str) -> bool:
     """Decide if a live web lookup will help for this turn."""
     history = history or []
-    if needs_live_search(message) or _is_entertainment_release_query(message):
+    if needs_live_search(message) or _is_entertainment_release_query(message) or _is_local_business_query(message):
         return True
     if intent == "followup" and history:
         combined = _build_live_search_query(message, history)
-        if needs_live_search(combined):
+        if needs_live_search(combined) or _is_local_business_query(combined):
             return True
-        return _prior_was_live_topic(history)
+        return _prior_was_live_topic(history) or _is_local_business_query(" ".join(_prior_user_queries(history, 2)))
     if history and _is_likely_continuation(message, history):
         prior_text = " ".join(_prior_user_queries(history, 2))
-        return needs_live_search(prior_text) or needs_live_search(f"{prior_text} {message}")
+        combined = f"{prior_text} {message}"
+        return (
+            needs_live_search(prior_text)
+            or needs_live_search(combined)
+            or _is_local_business_query(combined)
+        )
     return False
 
 
@@ -621,13 +689,17 @@ def _build_live_search_query(message: str, history: Optional[list] = None) -> st
     if history and _is_likely_continuation(message, history):
         prior_text = " ".join(_prior_user_queries(history, 3)).strip()
         combined = f"{prior_text} {message}".strip()
-        if needs_live_search(combined) or needs_live_search(prior_text):
+        if _is_local_business_query(combined) or _is_local_business_query(prior_text):
+            combined = f"{combined} address phone website contact details"
+        elif needs_live_search(combined) or needs_live_search(prior_text):
             if year not in combined:
                 combined = f"{combined} latest {month} {year}"
         return re.sub(r"\s+", " ", combined).strip()
 
     if needs_live_search(message):
         q = message
+        if _is_local_business_query(message):
+            q = f"{message} address phone website contact details"
         if year not in q and any(
             term in q.lower()
             for term in ("latest", "recent", "current", "currently", "today", "now", "this week", "this month")
@@ -937,6 +1009,14 @@ ENTERTAINMENT_TERMS = [
     "bollywood", "movie", "movies", "film", "films", "cinema", "box office",
     "hindi film", "hindi movie", "tollywood", "kollywood", "web series",
     "ott release", "theater", "theatre",
+]
+
+LOCAL_BUSINESS_TERMS = [
+    "hotel", "hotels", "hostel", "resort", "restaurant", "cafe", "class", "classes",
+    "course", "courses", "coaching", "tuition", "school", "college", "institute",
+    "hospital", "clinic", "doctor", "gym", "salon", "spa", "shop", "store",
+    "near me", "nearby", "address", "contact", "phone", "website", "location",
+    "training center", "academy", "library", "mall", "showroom",
 ]
 
 
@@ -1390,6 +1470,7 @@ async def chat_with_upload(
 async def chat_with_ai(request: Request):
     content_type = (request.headers.get("content-type") or "").lower()
     files = []
+    client_conversation = []
     if "multipart/form-data" in content_type:
         form = await request.form()
         message = str(form.get("message") or "").strip()
@@ -1403,10 +1484,11 @@ async def chat_with_ai(request: Request):
         email = payload.get("email")
         session_id = payload.get("session_id")
         files = []
+        client_conversation = payload.get("conversation") or payload.get("recent_turns") or []
 
     if not message:
         raise HTTPException(status_code=400, detail="Chat message is required.")
-    return await run_chat_message(message, email, session_id, files)
+    return await run_chat_message(message, email, session_id, files, client_conversation=client_conversation)
 
 
 async def run_chat_message(
@@ -1414,6 +1496,7 @@ async def run_chat_message(
     email: Optional[str],
     session_id: Optional[str],
     files: list,
+    client_conversation: Optional[list] = None,
 ):
     try:
         if not session_id:
@@ -1536,6 +1619,9 @@ async def run_chat_message(
             recent_history.reverse()
         except Exception as e:
             print(f"CHAT HISTORY LOAD ERROR: {e}")
+
+        client_history = _history_from_client_conversation(client_conversation)
+        recent_history = _merge_chat_history(recent_history, client_history)
         
         # Detect real-time data needs
         real_time_context = ""
@@ -1608,11 +1694,9 @@ async def run_chat_message(
         
         elif _should_live_search(message, recent_history, query_intent) and not real_time_context:
             search_target = live_search_query or message
-            max_items = 6 if (
-                query_intent == "followup"
-                or _is_likely_continuation(message, recent_history)
-                or needs_live_search(search_target)
-            ) else 5
+            max_items = 8 if _is_local_business_query(search_target) else 6
+            if not (_is_local_business_query(search_target) or query_intent == "followup" or _is_likely_continuation(message, recent_history) or needs_live_search(search_target)):
+                max_items = 5
             search_data = web_search(search_target, max_items=max_items)
             real_time_context = f"\n[{get_current_info()}]\n[Real-time Search Data: {search_data}]"
         
@@ -1631,6 +1715,8 @@ Rules:
 - **General knowledge:** answer clearly in helpful Markdown when no live data is needed.
 - Wrap shell/terminal commands in inline backticks or fenced ``` code blocks.
 - Only use uploaded document context when the question is about uploaded files.
+
+{_listing_format_guidance() if (_is_local_business_query(message) or (recent_history and _is_local_business_query(" ".join(_prior_user_queries(recent_history, 2))))) else ""}
 
 {_intent_guidance(query_intent)}
 
@@ -1770,7 +1856,15 @@ Rules:
                 print(f"RAG: No RAG context available (guest={is_guest}, embedding_ok={query_embedding is not None})")
 
 
-        messages.append({"role": "user", "content": message})
+        if query_intent == "followup" and history_for_prompt:
+            prior_topic = (history_for_prompt[-1].get("user_query") or "").strip()
+            user_content = (
+                f"Follow-up on our previous discussion about \"{prior_topic}\": {message}\n"
+                f"(Give more detail on that same topic. Do not ask me to clarify.)"
+            )
+        else:
+            user_content = message
+        messages.append({"role": "user", "content": user_content})
 
         # Get AI Response with full context
         if direct_reply:
