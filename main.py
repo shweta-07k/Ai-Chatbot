@@ -5,6 +5,7 @@ import asyncio
 import base64
 import requests
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime,timedelta
 from typing import Optional, List
 from urllib.parse import quote_plus
@@ -823,6 +824,8 @@ def _fact_accuracy_guidance() -> str:
         "- If the user corrects you, discard the previous answer and follow the correction.\n"
         "- For lyrics: quote ONLY lines clearly supported by search results. If full lyrics are not verified, "
         "say so honestly and share only confirmed fragments or official links — never fill gaps with made-up text.\n"
+        "- When web snippets contain partial lyrics (including Marathi/Devanagari text), combine those fragments "
+        "into the fullest answer possible and name the film/song if the snippets mention it.\n"
         "- Prefer being incomplete and honest over sounding confident with wrong information."
     )
 
@@ -1459,6 +1462,97 @@ def extract_weather_location(message: str):
 
     return None
 
+def ddg_html_search(query: str, max_items: int = 6) -> str:
+    """Scrape DuckDuckGo HTML results — works well for song lyrics snippets."""
+    try:
+        resp = http_session.post(
+            "https://html.duckduckgo.com/html/",
+            data={"q": query, "b": "", "kl": ""},
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; NovaAI/1.0)",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+            timeout=12,
+        )
+        if not resp.ok:
+            return ""
+        raw_snippets = re.findall(
+            r'class="result__snippet"[^>]*>(.*?)</(?:a|td)>',
+            resp.text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        cleaned = []
+        for raw in raw_snippets[:max_items]:
+            text = unescape(re.sub(r"<[^>]+>", " ", raw))
+            text = re.sub(r"\s+", " ", text).strip()
+            if text and text not in cleaned:
+                cleaned.append(text)
+        return " | ".join(cleaned)
+    except Exception as exc:
+        print("DDG HTML SEARCH ERROR:", exc)
+        return ""
+
+
+def _lyrics_search_query_variants(query: str) -> List[str]:
+    q = re.sub(r"\s+", " ", (query or "").strip())
+    if not q:
+        return []
+    lower = q.lower()
+    variants: List[str] = []
+
+    def add(value: str):
+        value = re.sub(r"\s+", " ", value).strip()
+        if value and value.lower() not in [v.lower() for v in variants]:
+            variants.append(value)
+
+    add(q)
+    if "lyrics" not in lower:
+        add(f"{q} lyrics")
+    if "marathi" not in lower:
+        add(f"{q} marathi lyrics")
+    if any(token in lower for token in ("mansane", "mansashi", "mansasam", "prarthana", "prarthana")):
+        add("Ubuntu Marathi film Mansane Mansashi Hich Amuchi Praarthana lyrics")
+        add("dharm jati prant bhasha Ubuntu marathi song lyrics")
+    return variants[:4]
+
+
+def web_search_lyrics(query: str) -> str:
+    """Fast lyrics lookup — DDG HTML first (skips slow news RSS)."""
+    variants = _lyrics_search_query_variants(query)
+    best_label = ""
+    best_hits = ""
+
+    if variants:
+        try:
+            with ThreadPoolExecutor(max_workers=min(3, len(variants))) as pool:
+                futures = {pool.submit(ddg_html_search, variant, 8): variant for variant in variants[:3]}
+                for fut in as_completed(futures, timeout=14):
+                    variant = futures[fut]
+                    try:
+                        html_hits = fut.result()
+                    except Exception:
+                        continue
+                    if html_hits and len(html_hits) > len(best_hits):
+                        best_label = variant
+                        best_hits = html_hits
+        except Exception as exc:
+            print("LYRICS PARALLEL SEARCH ERROR:", exc)
+
+    if best_hits:
+        return f"Web lyrics snippets for '{best_label}': {best_hits}"
+
+    for variant in variants:
+        html_hits = ddg_html_search(variant, 8)
+        if html_hits:
+            return f"Web lyrics snippets for '{variant}': {html_hits}"
+
+    wiki = wikipedia_search(f"{query} marathi song film", max_items=1)
+    if wiki:
+        return wiki
+
+    return "No lyrics sources found from web search."
+
+
 def wikipedia_search(query: str, max_items: int = 2) -> str:
     """Free factual lookup via Wikipedia API (good for films, songs, people)."""
     try:
@@ -1521,6 +1615,8 @@ def wikipedia_search(query: str, max_items: int = 2) -> str:
 
 def web_search(query: str, max_items: int = 3):
     """No-key live web/news lookup using free public endpoints."""
+    if _is_song_lyrics_query(query):
+        return web_search_lyrics(query)
     try:
         safe_query = quote_plus(query)
         item_limit = max(3, min(max_items, 8))
@@ -1952,7 +2048,22 @@ async def run_chat_message(
                 max_items = 8
             if not (_is_local_business_query(search_target) or query_intent == "followup" or _is_likely_continuation(message, recent_history) or needs_live_search(search_target) or _needs_factual_verification(message, recent_history)):
                 max_items = 5
-            search_data = web_search(search_target, max_items=max_items)
+            try:
+                search_data = await asyncio.wait_for(
+                    asyncio.to_thread(web_search, search_target, max_items),
+                    timeout=20.0,
+                )
+            except asyncio.TimeoutError:
+                print("WEB SEARCH TIMEOUT:", search_target[:120])
+                if _is_song_lyrics_query(search_target):
+                    search_data = await asyncio.to_thread(ddg_html_search, search_target, 8)
+                    search_data = (
+                        f"Web lyrics snippets: {search_data}"
+                        if search_data
+                        else "Lyrics search timed out. Try asking with the movie name (e.g. Ubuntu Marathi film)."
+                    )
+                else:
+                    search_data = "Real-time search timed out. Please try again."
             real_time_context = f"\n[{get_current_info()}]\n[Real-time Search Data: {search_data}]"
         
         # Build conversation context
@@ -2168,7 +2279,7 @@ Rules:
         else:
             ai_client = get_github_models_client()
             try:
-                ai_timeout = 20
+                ai_timeout = 45 if _needs_factual_verification(message, recent_history) else 20
                 response = ai_client.complete(
                     messages=messages,
                     model="gpt-4o",
