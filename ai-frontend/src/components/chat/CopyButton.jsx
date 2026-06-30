@@ -56,7 +56,7 @@ export default function CopyButton({ text, label = "Copy", className = "", title
   );
 }
 
-export function ShareButton({ text, className = "" }) {
+export function ShareButton({ text, className = "", title = "Share answer", shareTitle = "Nova AI Chat" }) {
   const [shared, setShared] = useState(false);
 
   const handleShare = async (e) => {
@@ -64,7 +64,7 @@ export function ShareButton({ text, className = "" }) {
     e.stopPropagation();
     if (navigator.share) {
       try {
-        await navigator.share({ title: "AI Answer", text });
+        await navigator.share({ title: shareTitle, text });
         setShared(true);
         window.setTimeout(() => setShared(false), 1800);
         return;
@@ -80,7 +80,7 @@ export function ShareButton({ text, className = "" }) {
   };
 
   return (
-    <button type="button" className={`share-btn ${className}`.trim()} onClick={handleShare} title="Share answer">
+    <button type="button" className={`share-btn ${className}`.trim()} onClick={handleShare} title={title}>
       <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
         <circle cx="18" cy="5" r="3" />
         <circle cx="6" cy="12" r="3" />

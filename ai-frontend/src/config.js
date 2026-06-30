@@ -13,6 +13,7 @@ export const GUEST_MESSAGE_LIMIT = 3;
 export const INITIAL_AI_MESSAGE = {
   role: "ai",
   text: "Hello! I'm your AI assistant. Ask me anything.",
+  isWelcome: true,
 };
 
 export async function loadGoogleClientId() {

@@ -351,6 +351,102 @@ button, input, textarea { font: inherit; }
   width: 100%;
 }
 
+.message-hover-wrap {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.message-hover-wrap.is-user {
+  align-items: flex-end;
+}
+
+.message-hover-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  margin-top: 0.45rem;
+  opacity: 1;
+  visibility: visible;
+  transition: opacity 0.18s ease, visibility 0.18s ease;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .message-hover-actions {
+    opacity: 0;
+    visibility: hidden;
+  }
+
+  .message-hover-wrap:hover .message-hover-actions,
+  .message-hover-wrap:focus-within .message-hover-actions {
+    opacity: 1;
+    visibility: visible;
+  }
+}
+
+.message-row.user .message-hover-actions {
+  justify-content: flex-end;
+}
+
+.chat-session-actions {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+  padding: 0.65rem 1rem 0.35rem;
+  border-top: 1px solid var(--border);
+  background: var(--bg);
+}
+
+.edit-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.3rem 0.55rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-soft);
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.18s ease, color 0.18s ease, border-color 0.18s ease;
+}
+
+.edit-btn:hover {
+  background: var(--bg-elevated);
+  color: var(--text);
+  border-color: rgba(37, 99, 235, 0.35);
+}
+
+.message-row.user .edit-btn {
+  color: rgba(255, 255, 255, 0.92);
+  background: rgba(255, 255, 255, 0.12);
+  border-color: rgba(255, 255, 255, 0.22);
+}
+
+.message-row.user .edit-btn:hover {
+  background: rgba(255, 255, 255, 0.2);
+  color: #fff;
+  border-color: rgba(255, 255, 255, 0.35);
+}
+
+.message-row.user .copy-btn,
+.message-row.user .share-btn {
+  color: rgba(255, 255, 255, 0.92);
+  background: rgba(255, 255, 255, 0.12);
+  border-color: rgba(255, 255, 255, 0.22);
+}
+
+.message-row.user .copy-btn:hover,
+.message-row.user .share-btn:hover {
+  background: rgba(255, 255, 255, 0.2);
+  color: #fff;
+  border-color: rgba(255, 255, 255, 0.35);
+}
+
 @keyframes slideUp {
   from { opacity: 0; transform: translateY(12px); }
   to { opacity: 1; transform: translateY(0); }

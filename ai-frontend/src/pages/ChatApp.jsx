@@ -7,6 +7,8 @@ import { useAuth } from "../context/AuthContext";
 import { useTheme } from "../context/ThemeContext";
 import MessageMarkdown from "../components/chat/MessageMarkdown";
 import AiLoadingBubble from "../components/chat/AiLoadingBubble";
+import CopyButton, { ShareButton } from "../components/chat/CopyButton";
+import { formatChatTranscript, stripAttachmentSuffix } from "../utils/chatTranscript";
 import AuthModal from "../components/auth/AuthModal";
 import ProfileModal from "../components/profile/ProfileModal";
 import StatusModal from "../components/ui/StatusModal";
@@ -404,6 +406,22 @@ export default function ChatApp({ googleEnabled = false }) {
     }
   };
 
+  const handleEditMessage = (index) => {
+    const msg = messages[index];
+    if (!msg || msg.role !== "user") return;
+    setInput(stripAttachmentSuffix(msg.text));
+    setMessages((prev) => {
+      const updated = prev.slice(0, index);
+      persistMessages(updated);
+      return updated;
+    });
+    setSelectedFiles([]);
+    if (attachmentInputRef.current) attachmentInputRef.current.value = "";
+  };
+
+  const chatTranscript = formatChatTranscript(messages);
+  const hasChatToExport = messages.some((m) => m.role === "user");
+
   return (
     <div className="app-shell">
       {sidebarOpen && <div className="sidebar-overlay" onClick={() => setSidebarOpen(false)} role="presentation" />}
@@ -483,7 +501,8 @@ export default function ChatApp({ googleEnabled = false }) {
                 <MessageMarkdown
                   text={msg.text}
                   role={msg.role}
-                  showActions={msg.role !== "ai" || msg.text !== INITIAL_AI_MESSAGE.text}
+                  showActions={msg.role === "user" || (!msg.isWelcome && msg.text !== INITIAL_AI_MESSAGE.text)}
+                  onEdit={msg.role === "user" ? () => handleEditMessage(i) : null}
                 />
                 {msg.role === "ai" && Array.isArray(msg.sources) && msg.sources.length > 0 && (
                   <div className="source-block">
@@ -507,6 +526,17 @@ export default function ChatApp({ googleEnabled = false }) {
           )}
           <div ref={chatEndRef} />
         </section>
+
+        {hasChatToExport && (
+          <div className="chat-session-actions">
+            <CopyButton text={chatTranscript} label="Copy chat" title="Copy entire conversation" />
+            <ShareButton
+              text={chatTranscript}
+              title="Share chat"
+              shareTitle="Nova AI Conversation"
+            />
+          </div>
+        )}
 
         <div className="composer-wrap">
           <div className="composer">
