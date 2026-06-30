@@ -18,6 +18,8 @@ services:
         generateValue: true
       - key: GOOGLE_CLIENT_ID
         sync: false
+      - key: ADMIN_EMAILS
+        value: shweta@gmail.com
       - key: NEO4J_ENABLED
         value: "false"
       - key: RAG_USE_REDIS
@@ -42,3 +44,5 @@ services:
           type: web
           name: nova-ai-api
           envVarKey: RENDER_EXTERNAL_URL
+      - key: REACT_APP_GOOGLE_CLIENT_ID
+        sync: false

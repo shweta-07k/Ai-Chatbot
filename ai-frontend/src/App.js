@@ -5,6 +5,7 @@ import { API_URL, GOOGLE_CLIENT_ID } from "./config";
 import { ThemeProvider } from "./context/ThemeContext";
 import { AuthProvider } from "./context/AuthContext";
 import ChatApp from "./pages/ChatApp";
+import AdminDashboard from "./pages/AdminDashboard";
 import LoginRedirect from "./pages/LoginRedirect";
 import RegisterRedirect from "./pages/RegisterRedirect";
 
@@ -15,6 +16,7 @@ function AppRoutes({ googleEnabled }) {
         <BrowserRouter>
           <Routes>
             <Route path="/" element={<ChatApp googleEnabled={googleEnabled} />} />
+            <Route path="/admin" element={<AdminDashboard />} />
             <Route path="/login" element={<LoginRedirect />} />
             <Route path="/register" element={<RegisterRedirect />} />
             <Route path="*" element={<Navigate to="/" replace />} />
@@ -26,15 +28,16 @@ function AppRoutes({ googleEnabled }) {
 }
 
 function App() {
-  const [googleClientId, setGoogleClientId] = useState(GOOGLE_CLIENT_ID);
+  const [googleClientId, setGoogleClientId] = useState((GOOGLE_CLIENT_ID || "").trim());
 
   useEffect(() => {
     if (googleClientId) return;
     fetch(`${API_URL}/config/public`)
       .then((res) => (res.ok ? res.json() : {}))
       .then((data) => {
-        if (data?.google_client_id) {
-          setGoogleClientId(data.google_client_id);
+        const id = (data?.google_client_id || "").trim();
+        if (id) {
+          setGoogleClientId(id);
         }
       })
       .catch(() => {});

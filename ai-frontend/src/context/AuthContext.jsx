@@ -16,7 +16,8 @@ export function AuthProvider({ children }) {
   const [user, setUser] = useState(() => {
     const email = localStorage.getItem("userEmail");
     const username = localStorage.getItem("username");
-    return email ? { email, username: username || "User" } : null;
+    const isAdmin = localStorage.getItem("isAdmin") === "1";
+    return email ? { email, username: username || "User", is_admin: isAdmin } : null;
   });
 
   const persistAuth = useCallback((payload) => {
@@ -24,11 +25,13 @@ export function AuthProvider({ children }) {
     localStorage.setItem("userToken", payload.access_token);
     localStorage.setItem("userEmail", payload.email);
     localStorage.setItem("username", payload.username);
+    localStorage.setItem("isAdmin", payload.is_admin ? "1" : "0");
     setUser({
       email: payload.email,
       username: payload.username,
       auth_provider: payload.auth_provider || "email",
       avatar_url: payload.avatar_url,
+      is_admin: Boolean(payload.is_admin),
     });
   }, []);
 
@@ -84,6 +87,7 @@ export function AuthProvider({ children }) {
     localStorage.removeItem("userToken");
     localStorage.removeItem("username");
     localStorage.removeItem("userEmail");
+    localStorage.removeItem("isAdmin");
     localStorage.removeItem("queryCount");
     localStorage.removeItem(key);
     localStorage.removeItem("chatSessionId");
@@ -104,6 +108,7 @@ export function AuthProvider({ children }) {
     if (!token) return null;
     const profile = await apiRequest("/me", { token });
     localStorage.setItem("username", profile.username);
+    localStorage.setItem("isAdmin", profile.is_admin ? "1" : "0");
     setUser((prev) => ({ ...prev, ...profile }));
     return profile;
   }, []);

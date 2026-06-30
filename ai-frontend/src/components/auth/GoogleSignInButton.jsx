@@ -27,7 +27,9 @@ export default function GoogleSignInButton({ mode = "login", disabled, onCredent
               onFail("Google sign-in did not complete. Please try again.");
             }
           }}
-          onError={() => onFail("Google sign-in was cancelled. Please try again or use email.")}
+          onError={() => onFail(
+            "Google sign-in failed (invalid_client). Use the same OAuth Web Client ID on API and frontend, and add your site URL under Authorized JavaScript origins in Google Cloud Console."
+          )}
           theme="outline"
           shape="rectangular"
           size="large"

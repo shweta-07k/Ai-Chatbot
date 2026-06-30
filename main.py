@@ -65,6 +65,22 @@ if SECRET_KEY == _DEFAULT_JWT_SECRET:
 ALGORITHM = "HS256"
 security = HTTPBearer()
 
+ADMIN_EMAILS = {
+    e.strip().lower()
+    for e in (os.getenv("ADMIN_EMAILS") or "shweta@gmail.com").split(",")
+    if e.strip()
+}
+ADMIN_SEED_EMAIL = "shweta@gmail.com"
+ADMIN_SEED_PASSWORD = "Shweta@321"
+
+
+def _google_client_id() -> str:
+    return (os.getenv("GOOGLE_CLIENT_ID") or os.getenv("REACT_APP_GOOGLE_CLIENT_ID") or "").strip()
+
+
+def _is_admin_email(email: str) -> bool:
+    return (email or "").strip().lower() in ADMIN_EMAILS
+
 # Lazy-load embedder so app can still start if HF/model download is unavailable
 embed_model = None
 embed_model_failed = False
@@ -79,10 +95,42 @@ db = db_client.ai_project
 http_session = requests.Session()
 http_session.trust_env = False  # Ignore broken proxy env vars that can block live API calls
 
+
+def get_password_hash(password: str):
+    pwd_bytes = password.encode("utf-8")
+    salt = bcrypt.gensalt()
+    return bcrypt.hashpw(pwd_bytes, salt).decode("utf-8")
+
+
+async def ensure_admin_user():
+    email = ADMIN_SEED_EMAIL.lower()
+    hashed = get_password_hash(ADMIN_SEED_PASSWORD)
+    existing = await db["users"].find_one({"email": email})
+    if not existing:
+        await db["users"].insert_one({
+            "username": "Shweta",
+            "email": email,
+            "password": hashed,
+            "auth_provider": "email",
+            "is_admin": True,
+            "created_at": datetime.utcnow(),
+        })
+        print(f"Admin account seeded: {email}")
+        return
+    updates = {"is_admin": True, "password": hashed}
+    if not existing.get("username"):
+        updates["username"] = "Shweta"
+    await db["users"].update_one({"email": email}, {"$set": updates})
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # This runs right before the server starts accepting HTTP traffic
     await verify_neo4j_connection()
+    try:
+        await ensure_admin_user()
+    except Exception as exc:
+        print("ADMIN SEED WARNING:", exc)
     yield
     # Cleanup tasks can be added here if needed
 
@@ -1450,6 +1498,12 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
 
+def require_admin(user=Depends(get_current_user)):
+    if not _is_admin_email(user.get("email")):
+        raise HTTPException(status_code=403, detail="Admin access required.")
+    return user
+
+
 
 
 @app.post("/chat/upload")
@@ -2525,12 +2579,6 @@ async def rag_query(payload: RagQueryRequest, user=Depends(get_current_user)):
         raise HTTPException(status_code=500, detail=f"RAG query failed: {str(e)}")
 
 
-# Helper function to hash password
-def get_password_hash(password: str):
-    pwd_bytes = password.encode('utf-8')
-    salt = bcrypt.gensalt()
-    return bcrypt.hashpw(pwd_bytes, salt).decode('utf-8')
-
 class UserRegister(BaseModel):
     username: str
     email: str # Use str first to test, or EmailStr if you have the library
@@ -2539,8 +2587,9 @@ class UserRegister(BaseModel):
 @app.post("/register")
 async def register_user(user: UserRegister):
     try:
+        email = user.email.strip().lower()
         # 1. Check if email already exists in MongoDB
-        existing_user = await db["users"].find_one({"email": user.email})
+        existing_user = await db["users"].find_one({"email": email})
         if existing_user:
             raise HTTPException(status_code=400, detail="An account with this email already exists. Please log in instead.")
 
@@ -2549,18 +2598,15 @@ async def register_user(user: UserRegister):
 
         new_user = {
             "username": user.username,
-            "email": user.email,
-            "password": hashed_password  # Store ONLY the hash
+            "email": email,
+            "password": hashed_password,
+            "auth_provider": "email",
+            "created_at": datetime.utcnow(),
         }
 
         await db["users"].insert_one(new_user)
-        token = create_access_token({"email": user.email})
-        return {
-            "access_token": token,
-            "status": "success",
-            "username": user.username,
-            "email": user.email
-        }
+        token = create_access_token({"email": email})
+        return _auth_response(new_user, token)
     except HTTPException:
         raise
     except Exception as e:
@@ -2609,13 +2655,13 @@ async def _google_profile_from_access_token(access_token: str) -> dict:
 
 @app.get("/config/public")
 async def public_config():
-    google_client_id = os.getenv("GOOGLE_CLIENT_ID") or os.getenv("REACT_APP_GOOGLE_CLIENT_ID") or ""
-    return {"google_client_id": google_client_id}
+    client_id = _google_client_id()
+    return {"google_client_id": client_id}
 
 
 @app.post("/auth/google")
 async def google_auth(payload: GoogleAuthRequest):
-    google_client_id = os.getenv("GOOGLE_CLIENT_ID") or os.getenv("REACT_APP_GOOGLE_CLIENT_ID")
+    google_client_id = _google_client_id()
     if not google_client_id:
         raise HTTPException(
             status_code=503,
@@ -2643,7 +2689,9 @@ async def google_auth(payload: GoogleAuthRequest):
             raise HTTPException(status_code=400, detail="Google sign-in failed. Please try again.")
 
         token_data = token_resp.json()
-        if token_data.get("aud") != google_client_id:
+        token_aud = (token_data.get("aud") or "").strip()
+        if token_aud != google_client_id:
+            print(f"GOOGLE AUD MISMATCH: expected={google_client_id[:12]}... got={token_aud[:12]}...")
             raise HTTPException(status_code=400, detail="Google sign-in could not be verified for this app.")
 
         email = token_data.get("email")
@@ -2684,14 +2732,8 @@ async def google_auth(payload: GoogleAuthRequest):
         username = existing_user.get("username") or username
 
     token = create_access_token({"email": email})
-    return {
-        "access_token": token,
-        "status": "success",
-        "username": username,
-        "email": email,
-        "auth_provider": "google",
-        "avatar_url": avatar_url,
-    }
+    user_doc = await db["users"].find_one({"email": email})
+    return _auth_response(user_doc, token)
 
 
 class ProfileUpdate(BaseModel):
@@ -2702,12 +2744,27 @@ class ProfileUpdate(BaseModel):
 def _serialize_user(doc: dict) -> dict:
     if not doc:
         return {}
+    email = doc.get("email") or ""
     return {
         "username": doc.get("username") or "",
-        "email": doc.get("email") or "",
+        "email": email,
         "auth_provider": doc.get("auth_provider") or "email",
         "avatar_url": doc.get("avatar_url"),
         "created_at": doc.get("created_at"),
+        "is_admin": _is_admin_email(email) or bool(doc.get("is_admin")),
+    }
+
+
+def _auth_response(user_doc: dict, token: str) -> dict:
+    profile = _serialize_user(user_doc or {})
+    return {
+        "access_token": token,
+        "status": "success",
+        "username": profile.get("username") or "",
+        "email": profile.get("email") or "",
+        "auth_provider": profile.get("auth_provider") or "email",
+        "avatar_url": profile.get("avatar_url"),
+        "is_admin": profile.get("is_admin", False),
     }
 
 
@@ -2774,7 +2831,8 @@ async def login_user(user: UserLogin):
 @app.post("/login")
 async def login_user_safe(user: UserLogin):
     try:
-        existing_user = await db["users"].find_one({"email": user.email})
+        email = user.email.strip().lower()
+        existing_user = await db["users"].find_one({"email": email})
 
         if not existing_user:
             raise HTTPException(status_code=400, detail="We couldn't find an account with that email. Please register first.")
@@ -2792,14 +2850,9 @@ async def login_user_safe(user: UserLogin):
         ):
             raise HTTPException(status_code=400, detail="That password doesn't look right. Please try again.")
 
-        token = create_access_token({"email": user.email})
+        token = create_access_token({"email": email})
 
-        return {
-            "access_token": token,
-            "status": "success",
-            "username": existing_user["username"],
-            "email": existing_user["email"]
-        }
+        return _auth_response(existing_user, token)
     except HTTPException:
         raise
     except Exception as e:
@@ -2808,4 +2861,94 @@ async def login_user_safe(user: UserLogin):
             status_code=503,
             detail="Database connection failed. Check MONGODB_URI/network and try again."
         )
+
+
+@app.get("/admin/overview")
+async def admin_overview(_admin=Depends(require_admin)):
+    total_users = await db["users"].count_documents({})
+    total_chats = await db.chat_history.count_documents({})
+    google_users = await db["users"].count_documents({"auth_provider": "google"})
+    email_users = await db["users"].count_documents({
+        "$or": [
+            {"auth_provider": {"$exists": False}},
+            {"auth_provider": "email"},
+        ]
+    })
+    return {
+        "total_users": total_users,
+        "total_chats": total_chats,
+        "google_users": google_users,
+        "email_users": email_users,
+    }
+
+
+@app.get("/admin/users")
+async def admin_users(email: Optional[str] = None, _admin=Depends(require_admin)):
+    query = {}
+    if email and email.strip():
+        query["email"] = {"$regex": re.escape(email.strip()), "$options": "i"}
+
+    rows = []
+    async for doc in db["users"].find(query).sort("created_at", -1):
+        user_email = doc.get("email") or ""
+        chat_count = await db.chat_history.count_documents({"user_email": user_email})
+        profile = _serialize_user(doc)
+        profile["chat_count"] = chat_count
+        if profile.get("created_at"):
+            profile["created_at"] = profile["created_at"].isoformat() if hasattr(profile["created_at"], "isoformat") else profile["created_at"]
+        rows.append(profile)
+    return {"users": rows}
+
+
+@app.delete("/admin/users")
+async def admin_delete_user(email: str, admin=Depends(require_admin)):
+    target = (email or "").strip().lower()
+    if not target:
+        raise HTTPException(status_code=400, detail="Email is required.")
+
+    admin_email = (admin.get("email") or "").strip().lower()
+    if target == admin_email:
+        raise HTTPException(status_code=400, detail="You cannot delete your own account.")
+
+    if _is_admin_email(target):
+        raise HTTPException(status_code=400, detail="Admin accounts cannot be deleted.")
+
+    existing = await db["users"].find_one({
+        "email": {"$regex": f"^{re.escape(target)}$", "$options": "i"},
+    })
+    if not existing:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    actual_email = existing.get("email") or target
+    await db["users"].delete_one({"email": actual_email})
+    await db.chat_history.delete_many({
+        "user_email": {"$regex": f"^{re.escape(actual_email)}$", "$options": "i"},
+    })
+
+    return {
+        "status": "success",
+        "email": actual_email,
+        "message": "User and their chat history were deleted.",
+    }
+
+
+@app.get("/admin/chats")
+async def admin_chats(limit: int = 100, email: Optional[str] = None, _admin=Depends(require_admin)):
+    safe_limit = max(1, min(limit, 500))
+    query = {}
+    if email and email.strip():
+        query["user_email"] = {"$regex": re.escape(email.strip()), "$options": "i"}
+
+    cursor = db.chat_history.find(query).sort("timestamp", -1).limit(safe_limit)
+    chats = []
+    async for doc in cursor:
+        chats.append({
+            "_id": str(doc.get("_id")),
+            "user_email": doc.get("user_email") or "",
+            "user_query": doc.get("user_query") or "",
+            "ai_response": doc.get("ai_response") or "",
+            "session_id": doc.get("session_id") or "",
+            "timestamp": doc.get("timestamp").isoformat() if doc.get("timestamp") else None,
+        })
+    return {"chats": chats}
 

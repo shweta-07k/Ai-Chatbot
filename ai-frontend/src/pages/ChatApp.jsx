@@ -6,6 +6,7 @@ import { friendlyChatError, friendlyUploadError } from "../utils/friendlyErrors"
 import { useAuth } from "../context/AuthContext";
 import { useTheme } from "../context/ThemeContext";
 import MessageMarkdown from "../components/chat/MessageMarkdown";
+import UserMessage from "../components/chat/UserMessage";
 import AiLoadingBubble from "../components/chat/AiLoadingBubble";
 import CopyButton, { ShareButton } from "../components/chat/CopyButton";
 import { formatChatTranscript, stripAttachmentSuffix } from "../utils/chatTranscript";
@@ -41,7 +42,7 @@ function getStoredSessionId(email) {
 }
 
 export default function ChatApp({ googleEnabled = false }) {
-  const { user, isAuthenticated, logout, startFreshSession } = useAuth();
+  const { user, isAuthenticated, logout, startFreshSession, refreshProfile } = useAuth();
   const { toggleTheme, isDark } = useTheme();
   const navigate = useNavigate();
   const location = useLocation();
@@ -110,6 +111,11 @@ export default function ChatApp({ googleEnabled = false }) {
       setLimitModalOpen(true);
     }
   }, [isAuthenticated, msgCount]);
+
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    refreshProfile().catch(() => {});
+  }, [isAuthenticated, refreshProfile]);
 
   useEffect(() => {
     const saved = readStoredMessages(sessionId);
@@ -444,6 +450,11 @@ export default function ChatApp({ googleEnabled = false }) {
           <button type="button" className="nav-btn" onClick={() => { openHistory(); setSidebarOpen(false); }}>
             <div><strong>History</strong><small>Saved conversations</small></div>
           </button>
+          {user?.is_admin ? (
+            <button type="button" className="nav-btn admin-nav-btn" onClick={() => { navigate("/admin"); setSidebarOpen(false); }}>
+              <div><strong>Admin dashboard</strong><small>All users & chats</small></div>
+            </button>
+          ) : null}
         </div>
 
         <div className="sidebar-footer">
@@ -497,26 +508,31 @@ export default function ChatApp({ googleEnabled = false }) {
         <section className="messages-panel">
           {messages.map((msg, i) => (
             <div key={`${i}-${msg.role}`} className={`message-row ${msg.role}`}>
-              <div className={`message-bubble ${msg.role === "ai" ? "ai-bubble-rich" : ""}`}>
-                <MessageMarkdown
+              {msg.role === "user" ? (
+                <UserMessage
                   text={msg.text}
-                  role={msg.role}
-                  showActions={msg.role === "user" || (!msg.isWelcome && msg.text !== INITIAL_AI_MESSAGE.text)}
-                  onEdit={msg.role === "user" ? () => handleEditMessage(i) : null}
+                  onEdit={() => handleEditMessage(i)}
                 />
-                {msg.role === "ai" && Array.isArray(msg.sources) && msg.sources.length > 0 && (
-                  <div className="source-block">
-                    <strong>Sources</strong>
-                    <ul>
-                      {msg.sources.slice(0, 5).map((s, idx) => (
-                        <li key={`${i}-src-${idx}`}>
-                          {typeof s === "string" ? s : `${s.source || "unknown"}${s.page ? ` (p.${s.page})` : ""}`}
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                )}
-              </div>
+              ) : (
+                <div className="message-bubble ai-bubble-rich">
+                  <MessageMarkdown
+                    text={msg.text}
+                    showActions={!msg.isWelcome && msg.text !== INITIAL_AI_MESSAGE.text}
+                  />
+                  {Array.isArray(msg.sources) && msg.sources.length > 0 && (
+                    <div className="source-block">
+                      <strong>Sources</strong>
+                      <ul>
+                        {msg.sources.slice(0, 5).map((s, idx) => (
+                          <li key={`${i}-src-${idx}`}>
+                            {typeof s === "string" ? s : `${s.source || "unknown"}${s.page ? ` (p.${s.page})` : ""}`}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           ))}
           {loading && (
