@@ -408,19 +408,93 @@ def _is_career_interview_query(message: str) -> bool:
     return any(re.search(pattern, lower) for pattern in patterns)
 
 
+def _prior_user_queries(history: Optional[list], limit: int = 3) -> List[str]:
+    history = history or []
+    return [
+        (chat.get("user_query") or "").strip()
+        for chat in history[-limit:]
+        if (chat.get("user_query") or "").strip()
+    ]
+
+
+def _prior_was_live_topic(history: Optional[list]) -> bool:
+    return any(needs_live_search(q) for q in _prior_user_queries(history, 3))
+
+
+def _is_standalone_question(message: str) -> bool:
+    """True when the message carries enough context to be a new, self-contained question."""
+    lower = (message or "").lower().strip()
+    if not lower:
+        return False
+    if len(lower.split()) >= 12:
+        return True
+    if _looks_like_general_question(message):
+        return True
+    if is_weather_query(message) or _is_career_interview_query(message):
+        return True
+    if re.search(
+        r"^(what|who|where|when|why|how|which|can you|tell me about|explain|describe|compare)\s+\S+\s+\S+",
+        lower,
+    ):
+        return True
+    return False
+
+
+def _is_clear_topic_switch(message: str, history: Optional[list]) -> bool:
+    """True when the user is obviously starting a new subject."""
+    if not history:
+        return False
+    lower = (message or "").lower().strip()
+    if any(
+        phrase in lower
+        for phrase in (
+            "instead",
+            "different question",
+            "new topic",
+            "forget that",
+            "change topic",
+            "another question",
+            "unrelated",
+        )
+    ):
+        return True
+    if is_weather_query(message) or _is_career_interview_query(message):
+        return True
+    if _is_standalone_question(message) and not _references_prior_context(message):
+        return True
+    return False
+
+
+def _is_likely_continuation(message: str, history: Optional[list]) -> bool:
+    """True when the latest message probably continues the same conversation thread."""
+    history = history or []
+    if not history:
+        return False
+    if _is_clear_topic_switch(message, history):
+        return False
+    if _references_prior_context(message) or _is_vague_followup(message):
+        return True
+    word_count = len((message or "").strip().split())
+    if word_count <= 8 and not _is_standalone_question(message):
+        return True
+    if _prior_was_live_topic(history) and word_count <= 12:
+        return True
+    return False
+
+
 def _resolve_query_intent(message: str, has_files: bool, history: Optional[list] = None) -> str:
     """Classify the current user message so the assistant routes to the right brain."""
     history = history or []
     if has_files:
         return "upload"
-    if history and (_is_vague_followup(message) or _references_prior_context(message)):
-        return "followup"
     if is_weather_query(message):
         return "weather"
     if _is_career_interview_query(message):
         return "career"
     if _is_upload_focused_query(message, has_files=False):
         return "upload"
+    if history and _is_likely_continuation(message, history):
+        return "followup"
     if needs_live_search(message) or _is_entertainment_release_query(message):
         return "live"
     return "general"
@@ -430,13 +504,14 @@ def _intent_guidance(intent: str) -> str:
     notes = {
         "general": (
             "Current question type: general knowledge. "
-            "Answer only what the user asked in their latest message. "
-            "Do not bring in unrelated topics from earlier in the chat."
+            "Answer the user's question directly. "
+            "If prior turns are included, decide whether the latest message continues that thread or starts something new."
         ),
         "followup": (
-            "Current question type: follow-up. "
-            "The user is continuing the previous topic — use recent conversation context and any live search data. "
-            "Do not ask them to clarify if the prior turn makes the topic obvious."
+            "Current question type: follow-up / continuation. "
+            "The latest message is almost certainly about the same subject as the previous turn. "
+            "Use conversation history plus any live search data. "
+            "Infer what the user means — do NOT ask them to clarify when context already makes it clear."
         ),
         "upload": (
             "Current question type: uploaded document. "
@@ -448,8 +523,9 @@ def _intent_guidance(intent: str) -> str:
         ),
         "live": (
             "Current question type: live/current information. "
-            "Use the real-time search data below. Only list names, dates, and facts explicitly supported by that data. "
-            "Do not invent titles or release dates. If results are incomplete, say what is confirmed and what is missing."
+            "Use the real-time search data below when answering. "
+            "Prefer facts from search results over memory. "
+            "Do not invent names, numbers, or dates. If results are incomplete, say what is confirmed."
         ),
         "career": (
             "Current question type: interview or career advice. "
@@ -460,18 +536,34 @@ def _intent_guidance(intent: str) -> str:
 
 
 def _should_include_conversation_history(message: str, intent: str, history: Optional[list] = None) -> bool:
-    """Only keep prior turns when the user is clearly continuing the same topic."""
+    """Keep prior turns when the user is continuing the same conversation thread."""
     history = history or []
-    if intent == "followup" or _references_prior_context(message):
-        return True
-    if history and _is_vague_followup(message):
-        return True
-    if intent in ("general", "weather", "career"):
+    if not history:
         return False
-    if intent == "live" and history and len((message or "").split()) <= 8:
-        return True
-    if intent == "upload" and not _references_prior_context(message):
+    if _is_clear_topic_switch(message, history):
         return False
+    if intent == "followup":
+        return True
+    if _is_likely_continuation(message, history):
+        return True
+    if intent == "upload" and _references_prior_context(message):
+        return True
+    return False
+
+
+def _should_live_search(message: str, history: Optional[list], intent: str) -> bool:
+    """Decide if a live web lookup will help for this turn."""
+    history = history or []
+    if needs_live_search(message) or _is_entertainment_release_query(message):
+        return True
+    if intent == "followup" and history:
+        combined = _build_live_search_query(message, history)
+        if needs_live_search(combined):
+            return True
+        return _prior_was_live_topic(history)
+    if history and _is_likely_continuation(message, history):
+        prior_text = " ".join(_prior_user_queries(history, 2))
+        return needs_live_search(prior_text) or needs_live_search(f"{prior_text} {message}")
     return False
 
 
@@ -481,24 +573,24 @@ def _is_vague_followup(message: str) -> bool:
     if not lower:
         return False
     word_count = len(lower.split())
-    if word_count > 10:
+    if word_count > 12:
         return False
     patterns = [
-        r"^(currently|currently released|currently release)\b",
-        r"^(what about now|right now|in theaters|in theatres|in cinema)\b",
-        r"^(this week|this month|today|now)\??$",
-        r"^(and |also |what else|any more|more names|more\??)\b",
-        r"^(which ones|name them|list them|tell me names|those ones)\b",
-        r"^(released|release|releases)\??$",
+        r"^(tell me more|more details|go on|continue|elaborate|expand)\b",
+        r"^(what about|how about|and what about)\b",
+        r"^(currently|right now|at the moment)\b",
+        r"^(this week|this month|today|now|latest)\??$",
+        r"^(and |also |what else|anything else|any more|more\??)\b",
+        r"^(which ones|name them|list them|give examples|examples)\b",
         r"^(like what|such as|for example)\??$",
-        r"^(it|that|this|those|these)\??$",
+        r"^(why|how so|what do you mean)\??$",
+        r"^(it|that|this|those|these|them)\??$",
+        r"^(yes|no|ok|okay|thanks|thank you)[,.!?\s]",
+        r"^(can you explain|explain more|more on that)\b",
     ]
     if any(re.search(pattern, lower) for pattern in patterns):
         return True
-    if word_count <= 5 and any(
-        term in lower
-        for term in ("released", "release", "current", "currently", "latest", "now", "today", "theater", "theatre")
-    ):
+    if word_count <= 6 and not _is_standalone_question(message):
         return True
     return False
 
@@ -517,29 +609,31 @@ def _is_entertainment_release_query(message: str) -> bool:
 
 
 def _build_live_search_query(message: str, history: Optional[list] = None) -> str:
-    """Expand vague follow-ups using the previous user question."""
+    """Build a search query; expand short follow-ups using prior user questions."""
     history = history or []
     message = (message or "").strip()
     if not message:
         return message
 
     year = str(datetime.utcnow().year)
-    if history and (_is_vague_followup(message) or _references_prior_context(message)):
-        prior_queries = [((chat.get("user_query") or "").strip()) for chat in history[-3:] if chat.get("user_query")]
-        prior_text = " ".join(prior_queries).strip()
+    month = datetime.utcnow().strftime("%B")
+
+    if history and _is_likely_continuation(message, history):
+        prior_text = " ".join(_prior_user_queries(history, 3)).strip()
         combined = f"{prior_text} {message}".strip()
-        if _is_entertainment_release_query(combined) or _is_entertainment_release_query(prior_text):
-            combined = f"Bollywood Hindi movies currently released in theaters India {year} {combined}"
-        elif year not in combined:
-            combined = f"{combined} {year}"
+        if needs_live_search(combined) or needs_live_search(prior_text):
+            if year not in combined:
+                combined = f"{combined} latest {month} {year}"
         return re.sub(r"\s+", " ", combined).strip()
 
-    if _is_entertainment_release_query(message):
-        return re.sub(
-            r"\s+",
-            " ",
-            f"Bollywood Hindi movies currently released in theaters India {year} {message}",
-        ).strip()
+    if needs_live_search(message):
+        q = message
+        if year not in q and any(
+            term in q.lower()
+            for term in ("latest", "recent", "current", "currently", "today", "now", "this week", "this month")
+        ):
+            q = f"{q} {month} {year}"
+        return re.sub(r"\s+", " ", q).strip()
 
     return message
 
@@ -834,8 +928,9 @@ LIVE_INFO_TERMS = [
     "breaking", "news", "update", "updates", "price", "prices", "stock",
     "crypto", "score", "match", "result", "results", "headlines", "search",
     "who won", "what happened", "this week", "this month", "this year",
-    "released", "release", "releases", "releasing", "new movie", "new film",
+    "released", "release", "releases", "releasing", "trending", "happening",
     "bollywood", "box office", "in theaters", "in theatres", "streaming",
+    "election", "poll", "weather today", "market today",
 ]
 
 ENTERTAINMENT_TERMS = [
@@ -1511,14 +1606,12 @@ async def run_chat_message(
                 direct_reply = "Please specify a city/location for live weather, for example: 'weather in Delhi now'."
                 direct_sources = ["Open-Meteo"]
         
-        elif needs_live_search(message) or _is_entertainment_release_query(message) or (
-            query_intent == "followup" and recent_history
-        ):
+        elif _should_live_search(message, recent_history, query_intent) and not real_time_context:
             search_target = live_search_query or message
             max_items = 6 if (
-                _is_entertainment_release_query(search_target)
-                or query_intent == "followup"
-                or _is_vague_followup(message)
+                query_intent == "followup"
+                or _is_likely_continuation(message, recent_history)
+                or needs_live_search(search_target)
             ) else 5
             search_data = web_search(search_target, max_items=max_items)
             real_time_context = f"\n[{get_current_info()}]\n[Real-time Search Data: {search_data}]"
@@ -1526,17 +1619,18 @@ async def run_chat_message(
         # Build conversation context
         system_prompt = f"""You are a helpful AI assistant with access to real-time information and optional uploaded document context.
 
-Answer the user's question clearly and accurately.
-- You are in a multi-turn chat. Focus on the user's **latest message** and give the answer they expect for that type of question.
-- Switch topics naturally: technology questions, weather, interview advice, and uploaded documents are all handled independently unless the user explicitly continues a prior topic.
-- For related follow-ups (e.g. "currently released", "tell me more", "what about now"), use prior conversation context and treat them as the same topic.
-- Never reply with "Could you clarify?" when the previous user message already established the topic (movies, weather, tech, etc.).
-- For new unrelated questions, answer only the new question — do not mix in earlier topics.
-- For general knowledge questions, answer from your own knowledge in helpful Markdown.
-- Wrap shell/terminal commands in inline backticks or fenced ``` code blocks so they are easy to copy.
-- Only use uploaded document context when the current question is about uploaded files.
-- If real-time context is available below, prioritize it for live data questions.
-- If you are unsure, say so clearly.
+Think like a human in a conversation:
+1. Read the prior turns (if any) and the latest user message together.
+2. Decide whether the latest message **continues the same topic** or **starts a new topic**.
+3. Answer what the user actually wants — infer missing details from context instead of asking "Could you clarify?" when the topic is already obvious.
+
+Rules:
+- **Continuation:** short replies ("currently?", "what about India?", "tell me more", "and price?") usually refer to the previous question — answer in that context.
+- **New topic:** a full standalone question on a different subject (e.g. weather after movies) should be answered on its own without mixing old topics.
+- **Live/current info:** when Real-time Search Data is provided below, prefer it over memory; do not invent facts.
+- **General knowledge:** answer clearly in helpful Markdown when no live data is needed.
+- Wrap shell/terminal commands in inline backticks or fenced ``` code blocks.
+- Only use uploaded document context when the question is about uploaded files.
 
 {_intent_guidance(query_intent)}
 
