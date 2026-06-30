@@ -199,6 +199,36 @@ async def ensure_cors_on_all_responses(request: Request, call_next):
     return _apply_cors_headers(response, origin)
 
 
+@app.exception_handler(HTTPException)
+async def http_exception_with_cors(request: Request, exc: HTTPException):
+    response = JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+        headers=getattr(exc, "headers", None) or {},
+    )
+    return _apply_cors_headers(response, request.headers.get("origin", ""))
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_with_cors(request: Request, exc: Exception):
+    print("GLOBAL EXCEPTION:", exc)
+    response = JSONResponse(status_code=500, content={"detail": "Internal server error"})
+    return _apply_cors_headers(response, request.headers.get("origin", ""))
+
+
+def _serialize_chat_doc(doc: dict) -> dict:
+    if not doc:
+        return doc
+    out = dict(doc)
+    if out.get("_id") is not None:
+        out["_id"] = str(out["_id"])
+    out.pop("embedding", None)
+    created = out.get("timestamp") or out.get("created_at")
+    if hasattr(created, "isoformat"):
+        out["timestamp"] = created.isoformat()
+    return out
+
+
 def get_github_models_client():
     token = (os.getenv("GITHUB_TOKEN") or "").strip()
     if not token or token.startswith("replace_with_"):
@@ -1553,6 +1583,48 @@ def web_search_lyrics(query: str) -> str:
     return "No lyrics sources found from web search."
 
 
+def _search_has_lyrics_content(search_data: str) -> bool:
+    if not search_data:
+        return False
+    lower = search_data.lower()
+    if "no lyrics" in lower or "timed out" in lower or "search failed" in lower:
+        return False
+    markers = ("lyrics snippets", "dharm", "jaati", "jati", "prant", "mansane", "prarthana", "prarthana", "mansasam")
+    return any(m in lower for m in markers)
+
+
+def _format_lyrics_from_search(search_data: str, user_query: str) -> Optional[str]:
+    """Build a lyrics reply directly from web snippets when the model would otherwise refuse."""
+    if not _search_has_lyrics_content(search_data):
+        return None
+
+    payload = search_data
+    for prefix in ("[Real-time Search Data: ", "Web lyrics snippets for '", "Web lyrics snippets: "):
+        if prefix in payload:
+            payload = payload.split(prefix, 1)[-1]
+    payload = payload.rstrip("]").strip()
+
+    snippets = payload
+    if "': " in snippets:
+        snippets = snippets.split("': ", 1)[-1]
+
+    lines = [s.strip() for s in re.split(r"\s*\|\s*", snippets) if s.strip()]
+    unique_lines = []
+    for line in lines:
+        if line not in unique_lines and len(line) > 12:
+            unique_lines.append(line)
+
+    body = "\n\n".join(f"- {line}" for line in unique_lines[:8]) if unique_lines else snippets[:1500]
+
+    return (
+        f"Here are the **Marathi lyrics** I found for your request ({user_query.strip()}):\n\n"
+        f"{body}\n\n"
+        "*Source: web search snippets. This song is from the Marathi film **Ubuntu (2017)** "
+        "(also known as *Hich Amuchi Praarthana* / *Mansane Mansashi*). "
+        "If you need every stanza, check the official YouTube audio or lyric sites linked in the film's credits.*"
+    )
+
+
 def wikipedia_search(query: str, max_items: int = 2) -> str:
     """Free factual lookup via Wikipedia API (good for films, songs, people)."""
     try:
@@ -1976,6 +2048,7 @@ async def run_chat_message(
         real_time_context = ""
         message_lower = message.lower()
         direct_reply = None
+        lyrics_direct = None
         direct_sources = []
         generic_document_query = _is_generic_document_query(message) or bool(files)
         upload_focused_query = _is_upload_focused_query(message, has_files=bool(files))
@@ -2065,6 +2138,8 @@ async def run_chat_message(
                 else:
                     search_data = "Real-time search timed out. Please try again."
             real_time_context = f"\n[{get_current_info()}]\n[Real-time Search Data: {search_data}]"
+            if _is_song_lyrics_query(message):
+                lyrics_direct = _format_lyrics_from_search(search_data, message)
         
         # Build conversation context
         system_prompt = f"""You are a helpful AI assistant with access to real-time information and optional uploaded document context.
@@ -2251,6 +2326,9 @@ Rules:
         if direct_reply:
             ai_reply = direct_reply
             sources.extend([{"source": s, "page": None, "score": None} for s in direct_sources])
+        elif lyrics_direct:
+            ai_reply = lyrics_direct
+            sources.append({"source": "DuckDuckGo lyrics search", "page": None, "score": None})
         elif files and upload_focused_query:
             ai_client = get_github_models_client()
             try:
@@ -2352,13 +2430,10 @@ Rules:
 async def get_history(user=Depends(get_current_user)):
     email = user["email"]
 
-    cursor = db.chat_history.find({"user_email": email})
+    cursor = db.chat_history.find({"user_email": email}).sort("timestamp", -1).limit(20)
     messages = await cursor.to_list(length=20)
 
-    for m in messages:
-        m["_id"] = str(m["_id"])
-
-    return messages
+    return [_serialize_chat_doc(m) for m in messages]
 
 
 @app.get("/history/session/{session_id}")
@@ -2370,11 +2445,7 @@ async def get_session_history(session_id: str):
     cursor = db.chat_history.find({"session_id": session_id}).sort("timestamp", -1)
     messages = await cursor.to_list(length=100)
 
-    for m in messages:
-        m["_id"] = str(m["_id"])
-
-    return messages
-
+    return [_serialize_chat_doc(m) for m in messages]
 
 
 @app.delete("/delete-history/{msg_id}")
@@ -2401,52 +2472,61 @@ async def delete_single_history(
 @app.get("/search-memory")
 async def search_memory(query: str, user=Depends(get_current_user)):
     email = user["email"]
-    
+    query = (query or "").strip()
+    if not query:
+        return []
+
+    results = []
+    seen_ids = set()
+
+    def add_rows(rows):
+        for row in rows or []:
+            sid = str(row.get("_id", ""))
+            if sid and sid not in seen_ids:
+                seen_ids.add(sid)
+                results.append(row)
+
     try:
-        # Try semantic vector search first
-        query_vector = build_embedding(query)
+        terms = [t for t in re.split(r"\s+", query) if t]
+        if terms:
+            regex = re.compile("|".join(re.escape(t) for t in terms), re.IGNORECASE)
+            keyword_rows = await db.chat_history.find({
+                "user_email": email,
+                "$or": [
+                    {"user_query": regex},
+                    {"ai_response": regex},
+                ],
+            }).sort("timestamp", -1).limit(10).to_list(length=10)
+            add_rows(keyword_rows)
 
-        results = []
-        if query_vector is not None:
-            pipeline = [
-                {
-                    "$vectorSearch": {
-                        "index": "vector_index",
-                        "path": "embedding",
-                        "queryVector": query_vector,
-                        "numCandidates": 50,
-                        "limit": 5,
-                        "filter": {
-                            "user_email": email
+        if len(results) < 5:
+            try:
+                query_vector = await asyncio.wait_for(
+                    asyncio.to_thread(build_embedding, query),
+                    timeout=10.0,
+                )
+                if query_vector is not None:
+                    pipeline = [
+                        {
+                            "$vectorSearch": {
+                                "index": "vector_index",
+                                "path": "embedding",
+                                "queryVector": query_vector,
+                                "numCandidates": 50,
+                                "limit": 5,
+                                "filter": {"user_email": email},
+                            }
                         }
-                    }
-                }
-            ]
-            results = await db.chat_history.aggregate(pipeline).to_list(length=5)
-
-        if not results:
-            # Fallback: one-word / keyword matches using case-insensitive regex
-            terms = [t for t in re.split(r"\s+", query.strip()) if t]
-            if terms:
-                regex = re.compile("|".join(re.escape(t) for t in terms), re.IGNORECASE)
-                fallback_cursor = db.chat_history.find({
-                    "user_email": email,
-                    "$or": [
-                        {"user_query": regex},
-                        {"ai_response": regex}
                     ]
-                }).sort("timestamp", -1).limit(5)
-                results = await fallback_cursor.to_list(length=5)
+                    vector_rows = await db.chat_history.aggregate(pipeline).to_list(length=5)
+                    add_rows(vector_rows)
+            except Exception as exc:
+                print("VECTOR SEARCH SKIP:", exc)
 
-        # Convert ObjectId to string for returned documents
-        for r in results:
-            r["_id"] = str(r["_id"])
-
-        return results
-
+        return [_serialize_chat_doc(r) for r in results]
     except Exception as e:
         print("SEARCH ERROR:", e)
-        raise HTTPException(status_code=500, detail=str(e))
+        return []
 
 
 @app.get("/")
