@@ -12,6 +12,7 @@ import xml.etree.ElementTree as ET
 from html import unescape
 from uuid import uuid4
 from fastapi import FastAPI, UploadFile, File, Form, Request
+from fastapi.responses import JSONResponse
 from jose import jwt
 from jose import JWTError
 from fastapi.middleware.cors import CORSMiddleware
@@ -135,6 +136,66 @@ async def lifespan(app: FastAPI):
     # Cleanup tasks can be added here if needed
 
 app = FastAPI(lifespan=lifespan)
+
+# CORS — allow Render frontend + local dev; patch headers on error responses too
+_cors_origins = [
+    origin.strip()
+    for origin in os.getenv(
+        "CORS_ORIGINS",
+        "http://localhost:3000,http://127.0.0.1:3000,"
+        "http://localhost:3001,http://127.0.0.1:3001,"
+        "http://localhost:5173,http://127.0.0.1:5173,"
+        "https://nova-ai-frontend.onrender.com",
+    ).split(",")
+    if origin.strip()
+]
+_cors_origin_regex = (
+    os.getenv(
+        "CORS_ORIGIN_REGEX",
+        r"https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?|https://.*\.onrender\.com",
+    )
+    or ""
+).strip()
+_cors_origin_pattern = re.compile(_cors_origin_regex) if _cors_origin_regex else None
+
+
+def _origin_is_allowed(origin: str) -> bool:
+    if not origin:
+        return False
+    if origin in _cors_origins:
+        return True
+    if _cors_origin_pattern and _cors_origin_pattern.fullmatch(origin):
+        return True
+    return False
+
+
+def _apply_cors_headers(response, origin: str):
+    if origin and _origin_is_allowed(origin):
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Vary"] = "Origin"
+    return response
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_origin_regex=_cors_origin_regex or None,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=True,
+)
+
+
+@app.middleware("http")
+async def ensure_cors_on_all_responses(request: Request, call_next):
+    origin = request.headers.get("origin", "")
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        print("UNHANDLED ERROR:", exc)
+        response = JSONResponse(status_code=500, content={"detail": "Internal server error"})
+    return _apply_cors_headers(response, origin)
 
 
 def get_github_models_client():
@@ -971,30 +1032,6 @@ def build_embedding(text: str):
     except Exception as e:
         print(f"❌ EMBED ERROR: {e}")
         return None
-
-# 2. CORS (explicit dev origins; wildcard + credentials is rejected by browsers)
-_cors_origins = [
-    origin.strip()
-    for origin in os.getenv(
-        "CORS_ORIGINS",
-        "http://localhost:3000,http://127.0.0.1:3000,"
-        "http://localhost:3001,http://127.0.0.1:3001,"
-        "http://localhost:5173,http://127.0.0.1:5173",
-    ).split(",")
-    if origin.strip()
-]
-_cors_origin_regex = os.getenv(
-    "CORS_ORIGIN_REGEX",
-    r"https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?|https://.*\.onrender\.com",
-)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_cors_origins,
-    allow_origin_regex=_cors_origin_regex,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    allow_credentials=True,
-)
 
 # Real-time data fetching functions
 WEATHER_CODE_LABELS = {
