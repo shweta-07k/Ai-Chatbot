@@ -667,6 +667,8 @@ def _resolve_query_intent(message: str, has_files: bool, history: Optional[list]
         return "upload"
     if history and _is_likely_continuation(message, history):
         return "followup"
+    if _needs_factual_verification(message, history):
+        return "live"
     if needs_live_search(message) or _is_entertainment_release_query(message):
         return "live"
     return "general"
@@ -694,10 +696,10 @@ def _intent_guidance(intent: str) -> str:
             "Answer about weather using live weather data when provided."
         ),
         "live": (
-            "Current question type: live/current information. "
+            "Current question type: live/current or factual lookup. "
             "Use the real-time search data below when answering. "
             "Prefer facts from search results over memory. "
-            "Do not invent names, numbers, or dates. If results are incomplete, say what is confirmed."
+            "Do not invent names, lyrics, numbers, or dates. If results are incomplete, say what is confirmed."
         ),
         "career": (
             "Current question type: interview or career advice. "
@@ -726,6 +728,8 @@ def _should_include_conversation_history(message: str, intent: str, history: Opt
 def _should_live_search(message: str, history: Optional[list], intent: str) -> bool:
     """Decide if a live web lookup will help for this turn."""
     history = history or []
+    if _needs_factual_verification(message, history):
+        return True
     if needs_live_search(message) or _is_entertainment_release_query(message) or _is_local_business_query(message):
         return True
     if intent == "followup" and history:
@@ -772,6 +776,57 @@ def _is_vague_followup(message: str) -> bool:
     return False
 
 
+def _is_song_lyrics_query(message: str) -> bool:
+    lower = (message or "").lower()
+    return any(term in lower for term in SONG_LYRICS_TERMS)
+
+
+def _is_user_correction(message: str) -> bool:
+    lower = (message or "").lower()
+    return any(term in lower for term in CORRECTION_TERMS)
+
+
+def _is_fact_lookup_query(message: str) -> bool:
+    lower = (message or "").lower()
+    if _is_song_lyrics_query(message):
+        return True
+    if any(term in lower for term in FACT_LOOKUP_TERMS):
+        return True
+    if any(term in lower for term in ENTERTAINMENT_TERMS) and any(
+        word in lower for word in ("who", "what", "when", "where", "which", "tell me about", "about the")
+    ):
+        return True
+    return False
+
+
+def _needs_factual_verification(message: str, history: Optional[list] = None) -> bool:
+    """True when the answer must come from search, not model memory."""
+    history = history or []
+    if _is_user_correction(message) or _is_song_lyrics_query(message) or _is_fact_lookup_query(message):
+        return True
+    if history:
+        prior_blob = " ".join(_prior_user_queries(history, 4)).lower()
+        if _is_song_lyrics_query(prior_blob) and _is_likely_continuation(message, history):
+            return True
+        if any(_is_user_correction(q) for q in _prior_user_queries(history, 2)):
+            return True
+    return False
+
+
+def _fact_accuracy_guidance() -> str:
+    return (
+        "Accuracy rules (critical):\n"
+        "- Answer ONLY what the user asked for — exact song, movie, recipe, person, or fact.\n"
+        "- When Real-time Search Data is provided, treat it as the primary source. Do NOT invent details.\n"
+        "- NEVER guess or fabricate song lyrics, cast names, dates, or which film/album a song belongs to.\n"
+        "- Similar titles from different movies are different songs — verify the movie/show name the user gave.\n"
+        "- If the user corrects you, discard the previous answer and follow the correction.\n"
+        "- For lyrics: quote ONLY lines clearly supported by search results. If full lyrics are not verified, "
+        "say so honestly and share only confirmed fragments or official links — never fill gaps with made-up text.\n"
+        "- Prefer being incomplete and honest over sounding confident with wrong information."
+    )
+
+
 def _is_entertainment_release_query(message: str) -> bool:
     lower = (message or "").lower()
     has_entertainment = any(term in lower for term in ENTERTAINMENT_TERMS)
@@ -794,6 +849,23 @@ def _build_live_search_query(message: str, history: Optional[list] = None) -> st
 
     year = str(datetime.utcnow().year)
     month = datetime.utcnow().strftime("%B")
+    prior_text = " ".join(_prior_user_queries(history, 4)).strip() if history else ""
+    combined = f"{prior_text} {message}".strip() if prior_text else message
+
+    if _is_user_correction(message) and prior_text:
+        query = f"{combined} correct verified"
+        if _is_song_lyrics_query(combined) or "lyrics" in combined.lower():
+            query = f"{combined} song lyrics verified"
+        return re.sub(r"\s+", " ", query).strip()
+
+    if _is_song_lyrics_query(message) or (prior_text and _is_song_lyrics_query(prior_text)):
+        query = combined
+        if "lyrics" not in query.lower():
+            query = f"{query} lyrics"
+        return re.sub(r"\s+", " ", query).strip()
+
+    if _is_fact_lookup_query(message) and prior_text:
+        return re.sub(r"\s+", " ", combined).strip()
 
     if history and _is_likely_continuation(message, history):
         prior_text = " ".join(_prior_user_queries(history, 3)).strip()
@@ -1093,7 +1165,27 @@ LIVE_INFO_TERMS = [
 ENTERTAINMENT_TERMS = [
     "bollywood", "movie", "movies", "film", "films", "cinema", "box office",
     "hindi film", "hindi movie", "tollywood", "kollywood", "web series",
-    "ott release", "theater", "theatre",
+    "ott release", "theater", "theatre", "marathi", "song", "songs",
+    "lyrics", "lyric", "soundtrack", "album", "gazal", "ghazal",
+]
+
+SONG_LYRICS_TERMS = [
+    "song", "songs", "lyrics", "lyric", "gazal", "ghazal", "anthem", "soundtrack",
+    "movie song", "film song", "full lyrics", "stanza", "opening line", "first stanza",
+    "pathava", "patha", "pahije", "marathi song", "hindi song", "album track",
+]
+
+CORRECTION_TERMS = [
+    "wrong", "incorrect", "not right", "that's not", "that is not", "is not correct",
+    "mistake", "mixed up", "different song", "wrong song", "actually", "i meant",
+    "i mean", "not about", "first stanza", "opening line", "no i want", "this is wrong",
+    "that's wrong", "you gave", "not the same",
+]
+
+FACT_LOOKUP_TERMS = [
+    "who wrote", "who sang", "who composed", "cast of", "director of", "plot of",
+    "release date", "box office", "biography of", "history of", "definition of",
+    "recipe for", "ingredients for", "how to make", "step by step",
 ]
 
 LOCAL_BUSINESS_TERMS = [
@@ -1367,11 +1459,78 @@ def extract_weather_location(message: str):
 
     return None
 
+def wikipedia_search(query: str, max_items: int = 2) -> str:
+    """Free factual lookup via Wikipedia API (good for films, songs, people)."""
+    try:
+        api = "https://en.wikipedia.org/w/api.php"
+        search_resp = http_session.get(
+            api,
+            params={
+                "action": "query",
+                "list": "search",
+                "srsearch": query,
+                "format": "json",
+                "utf8": 1,
+                "srlimit": max(1, min(max_items, 3)),
+            },
+            timeout=8,
+        )
+        if not search_resp.ok:
+            return ""
+        hits = (search_resp.json().get("query") or {}).get("search") or []
+        if not hits:
+            return ""
+
+        parts = []
+        for hit in hits[:max_items]:
+            title = hit.get("title") or ""
+            snippet = unescape(re.sub(r"<[^>]+>", "", hit.get("snippet") or "")).strip()
+            if not title:
+                continue
+            extract_resp = http_session.get(
+                api,
+                params={
+                    "action": "query",
+                    "prop": "extracts",
+                    "explaintext": 1,
+                    "exintro": 0,
+                    "titles": title,
+                    "format": "json",
+                    "redirects": 1,
+                },
+                timeout=8,
+            )
+            extract = ""
+            if extract_resp.ok:
+                pages = (extract_resp.json().get("query") or {}).get("pages") or {}
+                for page in pages.values():
+                    extract = (page.get("extract") or "").strip()
+                    if extract:
+                        extract = extract[:1200]
+                        break
+            if extract:
+                parts.append(f"Wikipedia — {title}: {extract}")
+            elif snippet:
+                parts.append(f"Wikipedia — {title}: {snippet}")
+
+        return " | ".join(parts) if parts else ""
+    except Exception as exc:
+        print("WIKIPEDIA SEARCH ERROR:", exc)
+        return ""
+
+
 def web_search(query: str, max_items: int = 3):
     """No-key live web/news lookup using free public endpoints."""
     try:
         safe_query = quote_plus(query)
         item_limit = max(3, min(max_items, 8))
+        sections = []
+        lower_q = (query or "").lower()
+
+        if any(term in lower_q for term in SONG_LYRICS_TERMS + list(ENTERTAINMENT_TERMS) + list(FACT_LOOKUP_TERMS)):
+            wiki = wikipedia_search(query, max_items=2)
+            if wiki:
+                sections.append(wiki)
 
         # 1) Google News RSS fallback (no key required)
         rss_url = f"https://news.google.com/rss/search?q={safe_query}"
@@ -1386,7 +1545,7 @@ def web_search(query: str, max_items: int = 3):
                     link = (item.findtext("link") or "").strip()
                     pub = (item.findtext("pubDate") or "").strip()
                     news_parts.append(f"{title} [{pub}] ({link})")
-                return "Latest news headlines: " + " | ".join(news_parts)
+                sections.append("Latest news headlines: " + " | ".join(news_parts))
 
         # 2) DuckDuckGo instant answer fallback (no key required)
         ddg_url = f"https://api.duckduckgo.com/?q={safe_query}&format=json&no_html=1&no_redirect=1"
@@ -1396,14 +1555,17 @@ def web_search(query: str, max_items: int = 3):
             abstract = (ddg.get("AbstractText") or "").strip()
             abstract_url = (ddg.get("AbstractURL") or "").strip()
             if abstract:
-                return f"DuckDuckGo instant result: {abstract} ({abstract_url})"
+                sections.append(f"DuckDuckGo instant result: {abstract} ({abstract_url})")
             related = ddg.get("RelatedTopics") or []
             snippets = []
             for t in related[:item_limit]:
                 if isinstance(t, dict) and t.get("Text"):
                     snippets.append(t.get("Text"))
             if snippets:
-                return "DuckDuckGo related results: " + " | ".join(snippets)
+                sections.append("DuckDuckGo related results: " + " | ".join(snippets))
+
+        if sections:
+            return " || ".join(sections)
 
         return "No recent live results found from available providers."
     except Exception as e:
@@ -1786,7 +1948,9 @@ async def run_chat_message(
         elif _should_live_search(message, recent_history, query_intent) and not real_time_context:
             search_target = live_search_query or message
             max_items = 8 if _is_local_business_query(search_target) else 6
-            if not (_is_local_business_query(search_target) or query_intent == "followup" or _is_likely_continuation(message, recent_history) or needs_live_search(search_target)):
+            if _needs_factual_verification(message, recent_history):
+                max_items = 8
+            if not (_is_local_business_query(search_target) or query_intent == "followup" or _is_likely_continuation(message, recent_history) or needs_live_search(search_target) or _needs_factual_verification(message, recent_history)):
                 max_items = 5
             search_data = web_search(search_target, max_items=max_items)
             real_time_context = f"\n[{get_current_info()}]\n[Real-time Search Data: {search_data}]"
@@ -1797,15 +1961,18 @@ async def run_chat_message(
 Think like a human in a conversation:
 1. Read the prior turns (if any) and the latest user message together.
 2. Decide whether the latest message **continues the same topic** or **starts a new topic**.
-3. Answer what the user actually wants — infer missing details from context instead of asking "Could you clarify?" when the topic is already obvious.
+3. Answer what the user actually wants — give the **exact** song, fact, recipe, or detail they asked for.
 
 Rules:
-- **Continuation:** short replies ("currently?", "what about India?", "tell me more", "and price?") usually refer to the previous question — answer in that context.
-- **New topic:** a full standalone question on a different subject (e.g. weather after movies) should be answered on its own without mixing old topics.
+- **Continuation:** short replies ("currently?", "what about India?", "tell me more", "and price?", "yes full lyrics") refer to the previous question — answer in that context.
+- **New topic:** a full standalone question on a different subject should be answered on its own without mixing old topics.
+- **Corrections:** if the user says your answer was wrong or gives the correct opening line/stanza, accept the correction and answer again for what THEY specified.
 - **Live/current info:** when Real-time Search Data is provided below, prefer it over memory; do not invent facts.
-- **General knowledge:** answer clearly in helpful Markdown when no live data is needed.
+- **General knowledge:** answer clearly in helpful Markdown when no live data is needed, but still do not guess specific lyrics, quotes, or names.
 - Wrap shell/terminal commands in inline backticks or fenced ``` code blocks.
 - Only use uploaded document context when the question is about uploaded files.
+
+{_fact_accuracy_guidance()}
 
 {_listing_format_guidance() if (_is_local_business_query(message) or (recent_history and _is_local_business_query(" ".join(_prior_user_queries(recent_history, 2))))) else ""}
 
@@ -1947,12 +2114,24 @@ Rules:
                 print(f"RAG: No RAG context available (guest={is_guest}, embedding_ok={query_embedding is not None})")
 
 
-        if query_intent == "followup" and history_for_prompt:
-            prior_topic = (history_for_prompt[-1].get("user_query") or "").strip()
+        if _is_user_correction(message) and history_for_prompt:
             user_content = (
-                f"Follow-up on our previous discussion about \"{prior_topic}\": {message}\n"
-                f"(Give more detail on that same topic. Do not ask me to clarify.)"
+                f"The user is correcting a previous answer. Their correction: {message}\n"
+                f"Use the search data and give the EXACT fact/song/lyrics they want. "
+                f"Do not repeat the wrong answer. Do not invent lyrics."
             )
+        elif query_intent == "followup" and history_for_prompt:
+            prior_topic = (history_for_prompt[-1].get("user_query") or "").strip()
+            if _is_song_lyrics_query(message) or _is_song_lyrics_query(prior_topic):
+                user_content = (
+                    f"Follow-up about \"{prior_topic}\": {message}\n"
+                    f"(Give the exact lyrics or song details requested. Use search data. Do not guess.)"
+                )
+            else:
+                user_content = (
+                    f"Follow-up on our previous discussion about \"{prior_topic}\": {message}\n"
+                    f"(Give more detail on that same topic. Do not ask me to clarify.)"
+                )
         else:
             user_content = message
         messages.append({"role": "user", "content": user_content})
