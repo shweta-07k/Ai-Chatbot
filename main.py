@@ -892,7 +892,11 @@ def _build_live_search_query(message: str, history: Optional[list] = None) -> st
         return re.sub(r"\s+", " ", query).strip()
 
     if _is_song_lyrics_query(message):
-        if history and _is_likely_continuation(message, history):
+        if (
+            history
+            and _is_likely_continuation(message, history)
+            and not _message_names_new_song(message, history)
+        ):
             prior_text = " ".join(_prior_user_queries(history, 3)).strip()
             query = f"{prior_text} {message}".strip()
         else:
@@ -901,7 +905,13 @@ def _build_live_search_query(message: str, history: Optional[list] = None) -> st
             query = f"{query} lyrics"
         return re.sub(r"\s+", " ", query).strip()
 
-    if prior_text and _is_song_lyrics_query(prior_text) and history and _is_likely_continuation(message, history):
+    if (
+        prior_text
+        and _is_song_lyrics_query(prior_text)
+        and history
+        and _is_likely_continuation(message, history)
+        and not _message_names_new_song(message, history)
+    ):
         query = combined
         if "lyrics" not in query.lower():
             query = f"{query} lyrics"
@@ -1713,6 +1723,40 @@ Jaya jaya jaya, jaya he""",
 ]
 
 
+def _extract_song_query_focus(message: str) -> str:
+    """Strip request boilerplate to isolate the likely song title in the message."""
+    text = (message or "").lower()
+    text = re.sub(
+        r"\b(can you|can u|could you|please|plz|send me|tell me|give me|show me|share|"
+        r"i want|i need|want|need|full|complete|entire|whole|song|songs|lyrics|lyric|"
+        r"gana|gaan|movie|film|from|the|a|an|me|my|of|about|what|is|are|do|does|"
+        r"you|u|know|have|get|find)\b",
+        " ",
+        text,
+    )
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _message_names_new_song(message: str, history: Optional[list]) -> bool:
+    """True when the user asked for a different song than the previous turn."""
+    if not history:
+        return True
+    focus = _extract_song_query_focus(message)
+    if not focus or len(focus.split()) <= 1 and focus in ("more", "rest", "all", "continue"):
+        return False
+    prior = (_prior_user_queries(history, 1) or [""])[-1]
+    prior_focus = _extract_song_query_focus(prior)
+    if not focus or not prior_focus:
+        return bool(focus)
+    if focus == prior_focus:
+        return False
+    current_words = {w for w in focus.split() if len(w) > 2}
+    prior_words = {w for w in prior_focus.split() if len(w) > 2}
+    if not current_words:
+        return False
+    return not (current_words & prior_words)
+
+
 def _score_lyrics_catalog_entry(entry: dict, text: str) -> int:
     """Score how well the current user text matches a catalog song (higher = better)."""
     lower = (text or "").lower()
@@ -1747,7 +1791,7 @@ def _score_lyrics_catalog_entry(entry: dict, text: str) -> int:
 
 
 def _lookup_known_lyrics(message: str, history: Optional[list] = None) -> Optional[dict]:
-    """Return curated lyrics only when the *current* message clearly names the song."""
+    """Return curated lyrics only when the current message clearly names the song."""
     history = history or []
     current = (message or "").strip()
     best_entry = None
@@ -1762,8 +1806,10 @@ def _lookup_known_lyrics(message: str, history: Optional[list] = None) -> Option
     if best_entry and best_score >= 5:
         return best_entry
 
-    # Short follow-ups like "full lyrics" or "second stanza" — use the prior song only
-    if history and _is_likely_continuation(current, history):
+    # Reuse prior song only for generic follow-ups like "full lyrics" — not a new song title
+    focus = _extract_song_query_focus(current)
+    generic_followup = not focus or focus in ("more", "rest", "all", "continue")
+    if generic_followup and history and _is_likely_continuation(current, history):
         prior_query = (_prior_user_queries(history, 1) or [""])[-1]
         for entry in KNOWN_LYRICS_CATALOG:
             score = _score_lyrics_catalog_entry(entry, prior_query)
@@ -1845,14 +1891,21 @@ def _format_lyrics_from_search(search_data: str, user_query: str) -> Optional[st
     )
 
 
-async def _resolve_lyrics_reply(message: str, history: Optional[list], timeout: float = 8.0) -> Optional[str]:
-    """Fast lyrics resolution: curated catalog first, then web snippets."""
-    known = _lookup_known_lyrics(message, history)
+async def _resolve_lyrics_reply(message: str, history: Optional[list], timeout: float = 5.0) -> Optional[str]:
+    """Fast lyrics resolution: catalog → web snippets → dedicated LLM call."""
+    lookup_history = None if _message_names_new_song(message, history) else history
+    known = _lookup_known_lyrics(message, lookup_history)
     if known:
         print(f"🎵 LYRICS FAST: known catalog match -> {known['id']}")
         return _format_known_lyrics(known, message)
 
-    search_q = _build_live_search_query(message, history)
+    if _message_names_new_song(message, history):
+        search_q = message.strip()
+        if "lyrics" not in search_q.lower():
+            search_q = f"{search_q} lyrics"
+    else:
+        search_q = _build_live_search_query(message, history)
+
     try:
         search_data = await asyncio.wait_for(
             asyncio.to_thread(web_search_lyrics, search_q),
@@ -1867,7 +1920,55 @@ async def _resolve_lyrics_reply(message: str, history: Optional[list], timeout: 
         print("🎵 LYRICS FAST: web snippets formatted")
         return formatted
 
-    return None
+    print("🎵 LYRICS FAST: falling back to LLM for:", message[:80])
+    return await _resolve_lyrics_via_llm(message)
+
+
+async def _resolve_lyrics_via_llm(message: str) -> Optional[str]:
+    """Direct LLM lyrics lookup — used when catalog/web search miss."""
+    try:
+        ai_client = get_github_models_client()
+
+        def _call():
+            return ai_client.complete(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You provide song lyrics. Give the full lyrics for the exact song the user named. "
+                            "Never return lyrics from a different song. Use Markdown. "
+                            "If you do not know that exact song, say so clearly."
+                        ),
+                    },
+                    {"role": "user", "content": message},
+                ],
+                model="gpt-4o",
+                connection_timeout=10,
+                read_timeout=25,
+            )
+
+        response = await asyncio.wait_for(asyncio.to_thread(_call), timeout=32.0)
+        if not response or not getattr(response, "choices", None):
+            return None
+        content = (response.choices[0].message.content or "").strip()
+        if len(content) < 40:
+            return None
+        lower = content.lower()
+        if any(
+            phrase in lower
+            for phrase in (
+                "unable to retrieve",
+                "can't provide the full lyrics",
+                "cannot provide the full lyrics",
+                "don't have the full lyrics",
+                "do not have the full lyrics",
+            )
+        ):
+            return None
+        return content
+    except Exception as exc:
+        print("LYRICS LLM ERROR:", exc)
+        return None
 
 
 def wikipedia_search(query: str, max_items: int = 2) -> str:
@@ -2305,7 +2406,7 @@ async def run_chat_message(
 
         # Fast path: song lyrics — return immediately without RAG/LLM (much faster on Render)
         if _is_song_lyrics_query(message) and not files:
-            lyrics_fast = await _resolve_lyrics_reply(message, recent_history, timeout=8.0)
+            lyrics_fast = await _resolve_lyrics_reply(message, recent_history, timeout=5.0)
             if lyrics_fast:
                 sources = [{"source": "Nova lyrics lookup", "page": None, "score": None}]
                 chat_doc = {
