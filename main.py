@@ -1447,14 +1447,15 @@ Answer the user's question clearly and accurately.
             messages.append({"role": "assistant", "content": chat.get("ai_response", "")})
 
         # ===== RAG INTEGRATION START =====
-        # Step 1: Embed query
-        query_embedding = build_embedding(message)
+        # Step 1: Embed query only when RAG retrieval is needed (saves ~400MB RAM on Render free tier)
+        query_embedding = None
         # Step 2: Retrieve relevant docs only when the question is about uploads
         docs = []
         graph_docs = []
         rag_context = ""
         sources = []
         if upload_focused_query or files or (query_intent == "upload" and generic_document_query):
+            query_embedding = build_embedding(message)
             if query_embedding is not None:
                 try:
                     docs = retrieve(query_embedding)
