@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import asyncio
 import base64
 import requests
 import json
@@ -53,7 +54,14 @@ from rag_prod.config import settings as rag_settings
 
 
 
-SECRET_KEY = os.getenv("JWT_SECRET_KEY", "mysecret123")
+_DEFAULT_JWT_SECRET = "mysecret123"
+SECRET_KEY = (os.getenv("JWT_SECRET_KEY") or _DEFAULT_JWT_SECRET).strip()
+if os.getenv("RENDER") and SECRET_KEY == _DEFAULT_JWT_SECRET:
+    raise RuntimeError(
+        "JWT_SECRET_KEY must be set in Render environment variables (not the dev default)."
+    )
+if SECRET_KEY == _DEFAULT_JWT_SECRET:
+    print("WARNING: Using default JWT_SECRET_KEY. Add JWT_SECRET_KEY to .env for auth.")
 ALGORITHM = "HS256"
 security = HTTPBearer()
 
@@ -1793,33 +1801,43 @@ async def health_check():
 
 
 @app.get("/health/status")
-async def health_status():
-    """Detailed stack health check for frontend/devops."""
+async def health_status(verify_ai: bool = False):
+    """Detailed stack health check. Pass ?verify_ai=1 to live-test GitHub Models (slow)."""
     mongo_ok = False
     mongo_error = None
     try:
-        await db.command("ping")
+        await asyncio.wait_for(db.command("ping"), timeout=5.0)
         mongo_ok = True
+    except asyncio.TimeoutError:
+        mongo_error = "MongoDB ping timed out after 5s"
     except Exception as exc:
         mongo_error = str(exc)
 
-    github_token_configured = bool((os.getenv("GITHUB_TOKEN") or "").strip()) and not (
-        os.getenv("GITHUB_TOKEN") or ""
-    ).strip().startswith("replace_with_")
+    github_token = (os.getenv("GITHUB_TOKEN") or "").strip()
+    github_token_configured = bool(github_token) and not github_token.startswith("replace_with_")
 
     github_token_ok = None
     github_token_error = None
-    if github_token_configured:
+    if not github_token_configured:
+        github_token_ok = False
+        github_token_error = "GITHUB_TOKEN is missing or placeholder"
+    elif verify_ai:
         try:
-            client = get_github_models_client()
-            response = client.complete(
-                messages=[{"role": "user", "content": "Reply with OK"}],
-                model="gpt-4o-mini",
-                max_tokens=3,
-                connection_timeout=10,
-                read_timeout=15,
-            )
+            def _probe_github_models():
+                client = get_github_models_client()
+                return client.complete(
+                    messages=[{"role": "user", "content": "Reply with OK"}],
+                    model="gpt-4o-mini",
+                    max_tokens=3,
+                    connection_timeout=5,
+                    read_timeout=8,
+                )
+
+            response = await asyncio.wait_for(asyncio.to_thread(_probe_github_models), timeout=12.0)
             github_token_ok = bool(response and getattr(response, "choices", None))
+        except asyncio.TimeoutError:
+            github_token_ok = False
+            github_token_error = "GitHub Models probe timed out"
         except ClientAuthenticationError:
             github_token_ok = False
             github_token_error = "Authentication failed. Create a new GitHub Models token and update GITHUB_TOKEN."
@@ -1832,20 +1850,28 @@ async def health_status():
         except Exception as exc:
             github_token_ok = False
             github_token_error = str(exc)
+    else:
+        github_token_ok = None
+        github_token_error = "Skipped live probe (use ?verify_ai=1)"
 
     neo4j_ok = False
     neo4j_error = None
-    try:
-        driver = get_neo4j_driver()
-        if driver is None:
-            neo4j_error = "Neo4j disabled or not configured"
-        else:
-            async with driver.session() as session:
-                result = await session.run("RETURN 1 AS v")
-                record = await result.single()
-                neo4j_ok = record is not None and record.get("v") == 1
-    except Exception as exc:
-        neo4j_error = str(exc)
+    if str(os.getenv("NEO4J_ENABLED", "true")).strip().lower() in {"0", "false", "no", "off"}:
+        neo4j_error = "Neo4j disabled (NEO4J_ENABLED=false)"
+    else:
+        try:
+            driver = get_neo4j_driver()
+            if driver is None:
+                neo4j_error = "Neo4j not configured"
+            else:
+                async with driver.session() as session:
+                    result = await asyncio.wait_for(session.run("RETURN 1 AS v"), timeout=5.0)
+                    record = await result.single()
+                    neo4j_ok = record is not None and record.get("v") == 1
+        except asyncio.TimeoutError:
+            neo4j_error = "Neo4j query timed out after 5s"
+        except Exception as exc:
+            neo4j_error = str(exc)
 
     return {
         "status": "ok" if mongo_ok else "degraded",
