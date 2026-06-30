@@ -19,7 +19,6 @@ from azure.ai.inference import ChatCompletionsClient
 from azure.core.exceptions import ClientAuthenticationError, HttpResponseError
 from azure.core.credentials import AzureKeyCredential
 from motor.motor_asyncio import AsyncIOMotorClient
-from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 from bson import ObjectId
 from contextlib import asynccontextmanager
@@ -647,6 +646,8 @@ def get_embed_model():
                 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
             print("🔧 EMBED MODEL: Loading 'all-MiniLM-L6-v2'...")
+            from sentence_transformers import SentenceTransformer
+
             embed_model = SentenceTransformer(
                 "all-MiniLM-L6-v2",
                 local_files_only=not allow_download,
@@ -1773,6 +1774,12 @@ async def search_memory(query: str, user=Depends(get_current_user)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/")
+async def root():
+    """Fast root probe for Render deploy / load balancer checks."""
+    return {"service": "nova-ai-api", "status": "ok"}
+
+
 @app.get("/ping")
 async def ping():
     return {"ok": True}
@@ -1780,7 +1787,13 @@ async def ping():
 
 @app.get("/health")
 async def health_check():
-    """Lightweight stack health check for frontend/devops."""
+    """Fast health check for Render deploy probes (must respond in <1s)."""
+    return {"status": "ok"}
+
+
+@app.get("/health/status")
+async def health_status():
+    """Detailed stack health check for frontend/devops."""
     mongo_ok = False
     mongo_error = None
     try:
