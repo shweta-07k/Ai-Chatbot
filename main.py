@@ -1220,13 +1220,13 @@ WEATHER_INTENT_TERMS = [
 ]
 
 LIVE_INFO_TERMS = [
-    "current", "currently", "today", "now", "latest", "recent", "live", "real time",
-    "breaking", "news", "update", "updates", "price", "prices", "stock",
+    "current", "currently", "today", "todays", "today's", "now", "latest", "recent", "live", "real time",
+    "breaking", "news", "update", "updates", "price", "prices", "stock", "stalk",
     "crypto", "score", "match", "result", "results", "headlines", "search",
     "who won", "what happened", "this week", "this month", "this year",
     "released", "release", "releases", "releasing", "trending", "happening",
     "bollywood", "box office", "in theaters", "in theatres", "streaming",
-    "election", "poll", "weather today", "market today",
+    "election", "poll", "weather today", "market today", "gold", "nifty", "sensex",
 ]
 
 ENTERTAINMENT_TERMS = [
@@ -1287,6 +1287,149 @@ def strip_weather_words(text: str) -> str:
 def is_weather_query(message: str) -> bool:
     normalized = compact_location_text(message or "").lower()
     return any(term in normalized for term in WEATHER_INTENT_TERMS)
+
+
+def _normalize_query_typos(message: str) -> str:
+    """Fix common typos so intent detection still works."""
+    text = (message or "").lower()
+    replacements = (
+        ("stalk market", "stock market"),
+        ("stalk ", "stock "),
+        (" maket", " market"),
+        ("nifty cahnges", "nifty changes"),
+        ("weathe ", "weather "),
+    )
+    for old, new in replacements:
+        text = text.replace(old, new)
+    return text
+
+
+def is_gold_rate_query(message: str) -> bool:
+    lower = _normalize_query_typos(message)
+    return "gold" in lower and any(t in lower for t in ("rate", "rates", "price", "prices", "today", "todays", "today's"))
+
+
+def is_news_query(message: str) -> bool:
+    lower = _normalize_query_typos(message)
+    has_news = any(t in lower for t in ("news", "headlines", "breaking", "headline"))
+    has_time = any(t in lower for t in ("today", "todays", "today's", "latest", "current", "now", "political"))
+    return has_news and (has_time or "political" in lower)
+
+
+def is_equity_market_query(message: str) -> bool:
+    lower = _normalize_query_typos(message)
+    keywords = (
+        "equity", "stock market", "share market", "nifty", "sensex",
+        "indices", "index", "stock ", " stocks", "market change", "market changes",
+    )
+    return any(word in lower for word in keywords)
+
+
+def _clean_search_for_display(search_data: str) -> str:
+    """Strip raw connection errors from text shown to users."""
+    if not search_data:
+        return ""
+    lower = search_data.lower()
+    bad_markers = (
+        "search failed", "timed out", "connectionpool", "max retries",
+        "connecttimeouterror", "connection to api.duckduckgo",
+    )
+    if any(m in lower for m in bad_markers):
+        return ""
+    if lower.startswith("no recent live results"):
+        return ""
+    return search_data.strip()
+
+
+def fetch_google_news_rss(query: str, max_items: int = 8, region: str = "IN") -> str:
+    """Fetch headlines from Google News RSS — reliable on cloud hosts."""
+    try:
+        safe_query = quote_plus(query)
+        ceid = "US:en" if region.upper() == "US" else "IN:en"
+        hl = "en-US" if region.upper() == "US" else "en-IN"
+        rss_url = f"https://news.google.com/rss/search?q={safe_query}&hl={hl}&gl={region}&ceid={ceid}"
+        rss_resp = http_session.get(rss_url, timeout=12)
+        if not rss_resp.ok or not rss_resp.text:
+            return ""
+        root = ET.fromstring(rss_resp.text)
+        items = root.findall(".//item")
+        if not items:
+            return ""
+        news_parts = []
+        for item in items[:max_items]:
+            title = unescape((item.findtext("title") or "Untitled").strip())
+            link = (item.findtext("link") or "").strip()
+            pub = (item.findtext("pubDate") or "").strip()
+            news_parts.append(f"{title} [{pub}] ({link})")
+        return "Latest news headlines: " + " | ".join(news_parts)
+    except Exception as exc:
+        print("GOOGLE NEWS RSS ERROR:", exc)
+        return ""
+
+
+def _format_live_headlines(title: str, search_data: str, extra: str = "") -> str:
+    """Turn RSS/search text into a clean bullet list for the user."""
+    headlines = []
+    payload = (search_data or "").replace("Latest news headlines:", "")
+    for part in re.split(r"\s*\|\s*", payload):
+        part = part.strip()
+        if not part or len(part) < 12:
+            continue
+        match = re.match(r"(.+?)\s*\[([^\]]+)\]\s*\((https?://[^\)]+)\)", part)
+        if match:
+            headlines.append(f"- **{match.group(1).strip()}** — _{match.group(2).strip()}_")
+        elif not part.lower().startswith("wikipedia"):
+            headlines.append(f"- {part[:300]}")
+
+    stamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    if headlines:
+        body = "\n".join(headlines[:10])
+        reply = f"**{title}** (as of {stamp}):\n\n{body}"
+        if extra:
+            reply += f"\n\n{extra}"
+        return reply
+
+    if extra:
+        return f"**{title}** (as of {stamp}):\n\n{extra}"
+    return ""
+
+
+def get_india_gold_rate_snapshot() -> str:
+    """Fetch indicative India gold rates from public sources."""
+    parts = []
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    try:
+        resp = http_session.get(
+            "https://www.goodreturns.in/gold-rates/",
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept-Language": "en-IN,en;q=0.9",
+            },
+            timeout=12,
+        )
+        if resp.ok:
+            text = resp.text
+            rates = []
+            for label, pattern in (
+                ("24 Carat (India)", r"24\s*[Cc]arat[^₹>]*₹\s*([\d,]+)"),
+                ("22 Carat (India)", r"22\s*[Cc]arat[^₹>]*₹\s*([\d,]+)"),
+            ):
+                match = re.search(pattern, text)
+                if match:
+                    rates.append(f"{label}: ₹{match.group(1)} per gram")
+            if rates:
+                parts.append(f"India gold rates as_of {now}: " + " | ".join(rates) + " (source: Goodreturns)")
+    except Exception as exc:
+        print("GOLD RATE SCRAPE ERROR:", exc)
+
+    rss = fetch_google_news_rss("gold rate today india 24 carat", max_items=5)
+    if rss:
+        parts.append(rss)
+
+    if not parts:
+        return "Live gold rate feed temporarily unavailable."
+    return " || ".join(parts)
 
 
 def needs_live_search(message: str) -> bool:
@@ -1944,58 +2087,50 @@ def wikipedia_search(query: str, max_items: int = 2) -> str:
 
 
 def web_search(query: str, max_items: int = 3):
-    """No-key live web/news lookup using free public endpoints."""
+    """No-key live web/news lookup — Google News RSS first; DDG is optional."""
     if _is_song_lyrics_query(query):
         return web_search_lyrics(query)
-    try:
-        safe_query = quote_plus(query)
-        item_limit = max(3, min(max_items, 8))
-        sections = []
-        lower_q = (query or "").lower()
 
-        if any(term in lower_q for term in SONG_LYRICS_TERMS + list(ENTERTAINMENT_TERMS) + list(FACT_LOOKUP_TERMS)):
+    item_limit = max(3, min(max_items, 10))
+    sections = []
+    lower_q = (query or "").lower()
+
+    if any(term in lower_q for term in SONG_LYRICS_TERMS + list(ENTERTAINMENT_TERMS) + list(FACT_LOOKUP_TERMS)):
+        try:
             wiki = wikipedia_search(query, max_items=2)
             if wiki:
                 sections.append(wiki)
+        except Exception as exc:
+            print("WEB SEARCH WIKI ERROR:", exc)
 
-        # 1) Google News RSS fallback (no key required)
-        rss_url = f"https://news.google.com/rss/search?q={safe_query}"
-        rss_resp = http_session.get(rss_url, timeout=7)
-        if rss_resp.ok and rss_resp.text:
-            root = ET.fromstring(rss_resp.text)
-            items = root.findall(".//item")
-            if items:
-                news_parts = []
-                for item in items[:item_limit]:
-                    title = unescape((item.findtext("title") or "Untitled").strip())
-                    link = (item.findtext("link") or "").strip()
-                    pub = (item.findtext("pubDate") or "").strip()
-                    news_parts.append(f"{title} [{pub}] ({link})")
-                sections.append("Latest news headlines: " + " | ".join(news_parts))
+    rss = fetch_google_news_rss(query, max_items=item_limit)
+    if rss:
+        sections.append(rss)
 
-        # 2) DuckDuckGo instant answer fallback (no key required)
+    try:
+        safe_query = quote_plus(query)
         ddg_url = f"https://api.duckduckgo.com/?q={safe_query}&format=json&no_html=1&no_redirect=1"
-        ddg_resp = http_session.get(ddg_url, timeout=7)
+        ddg_resp = http_session.get(ddg_url, timeout=4)
         if ddg_resp.ok:
             ddg = ddg_resp.json()
             abstract = (ddg.get("AbstractText") or "").strip()
             abstract_url = (ddg.get("AbstractURL") or "").strip()
             if abstract:
-                sections.append(f"DuckDuckGo instant result: {abstract} ({abstract_url})")
+                sections.append(f"DuckDuckGo: {abstract} ({abstract_url})")
             related = ddg.get("RelatedTopics") or []
             snippets = []
             for t in related[:item_limit]:
                 if isinstance(t, dict) and t.get("Text"):
                     snippets.append(t.get("Text"))
             if snippets:
-                sections.append("DuckDuckGo related results: " + " | ".join(snippets))
+                sections.append("DuckDuckGo related: " + " | ".join(snippets))
+    except Exception as exc:
+        print("WEB SEARCH DDG SKIP:", exc)
 
-        if sections:
-            return " || ".join(sections)
+    if sections:
+        return " || ".join(sections)
 
-        return "No recent live results found from available providers."
-    except Exception as e:
-        return f"Real-time search failed: {str(e)}"
+    return "No recent live results found from available providers."
 
 def get_india_equity_market_snapshot():
     """Fetch live India equity index snapshot from NSE + BSE official APIs."""
@@ -2305,6 +2440,7 @@ async def run_chat_message(
         # Detect real-time data needs
         real_time_context = ""
         message_lower = message.lower()
+        normalized_lower = _normalize_query_typos(message)
         direct_reply = None
         lyrics_direct = None
         direct_sources = []
@@ -2340,46 +2476,105 @@ async def run_chat_message(
                 response_payload["session_id"] = session_id
             return response_payload
 
-        is_equity_query = any(
-            word in message_lower
-            for word in ["equity", "stock market", "share market", "nifty", "sensex", "indices", "index"]
-        )
+        is_equity_query = is_equity_market_query(message)
         home_terms = ["home", "house", "property", "real estate", "apartment", "flat", "housing"]
         rate_terms = ["rate", "rates", "price", "prices", "market", "cost", "valuation", "situation"]
         is_home_market_query = (
-            any(word in message_lower for word in home_terms)
-            and any(word in message_lower for word in rate_terms)
+            any(word in normalized_lower for word in home_terms)
+            and any(word in normalized_lower for word in rate_terms)
         )
-        
-        if is_equity_query:
+
+        if is_gold_rate_query(message):
+            gold_data = get_india_gold_rate_snapshot()
+            headline_data = fetch_google_news_rss("gold rate today india 24 carat", max_items=6)
+            direct_reply = _format_live_headlines(
+                "Today's gold rate (India)",
+                headline_data,
+                extra=gold_data if "India gold rates" in gold_data else "",
+            )
+            if not direct_reply:
+                direct_reply = (
+                    f"As of {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}:\n{gold_data}\n\n"
+                    "*Source: Goodreturns / Google News RSS*"
+                )
+            direct_sources = ["Goodreturns", "Google News RSS"]
+
+        elif _is_entertainment_release_query(message):
+            month_year = datetime.utcnow().strftime("%B %Y")
+            search_data = fetch_google_news_rss(f"latest hindi movies released {month_year}", max_items=10)
+            if not search_data:
+                search_data = fetch_google_news_rss("bollywood new movie releases", max_items=10)
+            direct_reply = _format_live_headlines(
+                f"Latest Hindi movies to watch ({month_year})",
+                search_data,
+                extra="*Check BookMyShow or IMDb for trailers and showtimes near you.*",
+            )
+            if not direct_reply:
+                direct_reply = (
+                    f"Live movie listings are limited right now. "
+                    f"Check BookMyShow or IMDb for **Hindi releases in {month_year}**."
+                )
+            direct_sources = ["Google News RSS"]
+
+        elif is_news_query(message):
+            region = "US" if any(w in normalized_lower for w in ("uk", "london", "britain", "usa", "america")) else "IN"
+            search_data = fetch_google_news_rss(message, max_items=10, region=region)
+            if not search_data:
+                search_data = _clean_search_for_display(web_search(message, max_items=8))
+            direct_reply = _format_live_headlines("Today's news headlines", search_data or "")
+            if not direct_reply:
+                direct_reply = "News feeds are slow right now. Try BBC, Reuters, or Google News."
+            direct_sources = ["Google News RSS"]
+
+        elif is_equity_query:
             equity_data = get_india_equity_market_snapshot()
-            search_data = web_search(message)
-            real_time_context = (
-                f"\n[{get_current_info()}]"
-                f"\n[India Equity Snapshot: {equity_data}]"
-                f"\n[Related Live Search: {search_data}]"
+            search_data = _clean_search_for_display(
+                web_search(f"nifty sensex market news {datetime.utcnow().strftime('%B %Y')}", max_items=4)
             )
             direct_reply = (
                 f"As of {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}, India equity snapshot:\n"
-                f"{equity_data}\n\n"
-                f"Live market context:\n{search_data}"
+                f"{equity_data}"
             )
-            direct_sources = ["NSE", "BSE", "Google News RSS/DDG"]
+            if search_data:
+                news_block = _format_live_headlines("Related market news", search_data)
+                if news_block:
+                    direct_reply += f"\n\n{news_block}"
+            direct_sources = ["NSE", "BSE", "Google News RSS"]
 
-        elif is_home_market_query and any(x in message_lower for x in ["india", "indian"]):
+        elif is_home_market_query and any(x in normalized_lower for x in ["india", "indian"]):
             home_data = get_india_home_market_snapshot()
-            search_data = web_search(message)
-            real_time_context = (
-                f"\n[{get_current_info()}]"
-                f"\n[India Home Market Snapshot: {home_data}]"
-                f"\n[Related Live Search: {search_data}]"
-            )
+            search_data = _clean_search_for_display(web_search(message, max_items=4))
             direct_reply = (
                 f"As of {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}, India home market snapshot:\n"
-                f"{home_data}\n\n"
-                f"Live market context:\n{search_data}"
+                f"{home_data}"
             )
-            direct_sources = ["Numbeo", "Google News RSS/DDG"]
+            if search_data:
+                direct_reply += f"\n\nRelated context:\n{search_data}"
+            direct_sources = ["Numbeo", "Google News RSS"]
+
+        elif _is_local_business_query(message):
+            search_data = fetch_google_news_rss(f"{message} zomato google maps", max_items=8)
+            if not search_data:
+                try:
+                    search_data = _clean_search_for_display(
+                        await asyncio.wait_for(asyncio.to_thread(web_search, message, 8), timeout=12.0)
+                    )
+                except asyncio.TimeoutError:
+                    search_data = ""
+            direct_reply = _format_live_headlines(
+                f"Results for: {message}",
+                search_data or "",
+                extra=(
+                    "*For verified addresses, ratings, and phone numbers, search the same area on "
+                    "**Google Maps** or **Zomato** — do not rely on unverified numbers.*"
+                ),
+            )
+            if not direct_reply:
+                direct_reply = (
+                    f"I couldn't fetch live listings for **{message}** right now.\n\n"
+                    "Open **Google Maps** or **Zomato** and search that area for up-to-date restaurant details."
+                )
+            direct_sources = ["Google News RSS"]
 
         elif is_weather_query(message):
             location = extract_weather_location(message)
@@ -2416,10 +2611,11 @@ async def run_chat_message(
                     search_data = (
                         f"Web lyrics snippets: {search_data}"
                         if search_data
-                        else "Lyrics search timed out. Try asking with the movie name (e.g. Ubuntu Marathi film)."
+                        else "Lyrics search timed out. Try asking with the movie name."
                     )
                 else:
-                    search_data = "Real-time search timed out. Please try again."
+                    search_data = fetch_google_news_rss(search_target, max_items=6) or "Real-time search timed out. Please try again."
+            search_data = _clean_search_for_display(search_data) or search_data
             real_time_context = f"\n[{get_current_info()}]\n[Real-time Search Data: {search_data}]"
             if _is_song_lyrics_query(message):
                 lyrics_direct = _format_lyrics_from_search(
