@@ -882,9 +882,14 @@ def _is_entertainment_release_query(message: str) -> bool:
         for term in (
             "latest", "recent", "released", "release", "new", "current", "currently",
             "now", "today", "this week", "this month", "upcoming", "in theater", "in theatre",
+            "to watch", "what to watch", "recommend", "suggest",
         )
     )
-    return has_entertainment and has_release_intent
+    if has_entertainment and has_release_intent:
+        return True
+    if has_entertainment and any(p in lower for p in ("movies to watch", "films to watch", "movie list", "new hindi")):
+        return True
+    return False
 
 
 def _build_live_search_query(message: str, history: Optional[list] = None) -> str:
@@ -1202,15 +1207,26 @@ LOCATION_ALIASES = {
     "chh sambhajinagar": "Aurangabad",
     "chhatrapati sambhajinagar": "Aurangabad",
     "csn": "Aurangabad",
+    "lodon": "London",
+    "londn": "London",
+    "londom": "London",
 }
+
+
+POEM_CREATIVE_TERMS = (
+    "poem", "poems", "poetry", "shayari", "shayri", "ghazal", "gazal",
+    "verse", "verses", "rhyme", "rhymes", "couplet", "haiku", "sonnet",
+)
 
 
 LOCATION_STOP_WORDS = {
     "what", "whats", "is", "the", "weather", "temperature", "forecast",
-    "rain", "climate", "in", "at", "for", "near", "today", "now", "current",
+    "rain", "rainy", "climate", "in", "at", "for", "near", "today", "now", "current",
     "tell", "me", "todays", "today's", "temp", "upcoming", "details", "and",
     "please", "of", "about", "conditions", "condition", "humidity", "wind",
     "let", "know", "weathe", "wether", "whether", "degree", "degrees",
+    "some", "want", "i", "season", "seasons", "poem", "poems", "poetry",
+    "give", "share", "send", "write", "need",
 }
 
 
@@ -1284,9 +1300,34 @@ def strip_weather_words(text: str) -> str:
     return " ".join(kept).strip(" ,.-")
 
 
+def _is_poem_or_creative_request(message: str) -> bool:
+    lower = (message or "").lower()
+    return any(term in lower for term in POEM_CREATIVE_TERMS)
+
+
 def is_weather_query(message: str) -> bool:
+    if _is_poem_or_creative_request(message):
+        return False
+
     normalized = compact_location_text(message or "").lower()
-    return any(term in normalized for term in WEATHER_INTENT_TERMS)
+
+    strong_weather_terms = (
+        "weather", "weathe", "wether", "temperature", "temp", "forecast",
+        "climate", "humidity", "wind", "degree", "degrees",
+    )
+    if any(term in normalized for term in strong_weather_terms):
+        return True
+
+    # "rain" alone often means poems or monsoon talk — require a place or explicit weather context
+    if "rain" in normalized or "rainy" in normalized:
+        if any(w in normalized for w in ("season", "poem", "poems", "poetry", "monsoon poem")):
+            return False
+        if re.search(r"\b(?:weather|forecast|today|tomorrow|now|currently)\b", normalized):
+            return True
+        if re.search(r"\b(?:in|at|for|near)\s+[a-z]{2,}", normalized):
+            return True
+
+    return False
 
 
 def _normalize_query_typos(message: str) -> str:
@@ -1298,6 +1339,8 @@ def _normalize_query_typos(message: str) -> str:
         (" maket", " market"),
         ("nifty cahnges", "nifty changes"),
         ("weathe ", "weather "),
+        ("lodon", "london"),
+        ("londn", "london"),
     )
     for old, new in replacements:
         text = text.replace(old, new)
@@ -1641,7 +1684,7 @@ def get_weather(location: str):
         return f"Weather lookup failed: {str(e)}"
 def extract_weather_location(message: str):
     """Extract a likely location from weather question text."""
-    msg = compact_location_text(message or "")
+    msg = compact_location_text(_normalize_query_typos(message or ""))
     if not msg:
         return None
 
@@ -1653,7 +1696,6 @@ def extract_weather_location(message: str):
     )
     if match:
         candidate = match.group(1).strip(" ,.?!")
-        # Remove trailing time words often attached to queries.
         candidate = re.sub(
             r"\b(today|tomorrow|now|currently|right now|please|and|upcoming|forecast|details)\b.*$",
             "",
@@ -1661,11 +1703,15 @@ def extract_weather_location(message: str):
             flags=re.IGNORECASE,
         ).strip(" ,.?!")
         if candidate:
-            return normalize_location_query(candidate)
+            normalized = normalize_location_query(candidate)
+            if normalized.lower() not in POEM_CREATIVE_TERMS and len(normalized.split()) <= 6:
+                return normalized
 
     fallback = strip_weather_words(msg)
-    if fallback:
-        return normalize_location_query(fallback)
+    if fallback and fallback.lower() not in POEM_CREATIVE_TERMS:
+        word_count = len(fallback.split())
+        if word_count <= 4:
+            return normalize_location_query(fallback)
 
     return None
 
