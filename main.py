@@ -844,6 +844,20 @@ def _needs_factual_verification(message: str, history: Optional[list] = None) ->
     return False
 
 
+def _is_lyrics_request(message: str, history: Optional[list] = None) -> bool:
+    """True for direct lyrics queries or short affirmations after a lyrics question."""
+    if _is_song_lyrics_query(message):
+        return True
+    history = history or []
+    if not history:
+        return False
+    lower = (message or "").lower().strip()
+    if lower in ("sure", "yes", "yes please", "ok", "okay", "go ahead", "please", "do it"):
+        prior = (_prior_user_queries(history, 1) or [""])[-1]
+        return _is_song_lyrics_query(prior)
+    return False
+
+
 def _fact_accuracy_guidance() -> str:
     return (
         "Accuracy rules (critical):\n"
@@ -1568,7 +1582,7 @@ def _lyrics_search_query_variants(query: str) -> List[str]:
     q = re.sub(r"\s+", " ", (query or "").strip())
     if not q:
         return []
-    lower = q.lower()
+    focus = _extract_song_query_focus(q) or q
     variants: List[str] = []
 
     def add(value: str):
@@ -1576,151 +1590,71 @@ def _lyrics_search_query_variants(query: str) -> List[str]:
         if value and value.lower() not in [v.lower() for v in variants]:
             variants.append(value)
 
-    add(q)
-    if "lyrics" not in lower:
+    add(f"{focus} lyrics")
+    add(f"{focus} song lyrics")
+    if "lyrics" not in q.lower():
         add(f"{q} lyrics")
-    if "marathi" not in lower:
-        add(f"{q} marathi lyrics")
-    if any(token in lower for token in ("mansane", "mansashi", "mansasam", "prarthana", "praarthana", "ubuntu")):
-        add("Ubuntu Marathi film Mansane Mansashi Hich Amuchi Praarthana lyrics")
-        add("dharm jati prant bhasha Ubuntu marathi song lyrics")
-    if "lungi dance" in lower or ("lungi" in lower and "dance" in lower):
-        add("Lungi Dance Chennai Express Yo Yo Honey Singh full lyrics")
+    add(f"{focus} full lyrics")
     return variants[:4]
 
 
+def _normalize_song_title(title: str) -> str:
+    """Fix common spellings so search/LLM target the right song."""
+    lower = (title or "").lower().strip()
+    aliases = {
+        "kajrare": "kajra re",
+        "kajraare": "kajra re",
+        "kajra re": "kajra re",
+        "mansane mansashi manasasam": "mansane mansashi hich amuchi praarthana ubuntu",
+        "mansane mansashi": "mansane mansashi ubuntu marathi",
+        "sunya sunya maifilit mazya": "sunya sunya maifilit mazya marathi",
+        "sunya sunya maifilit mzya": "sunya sunya maifilit mazya marathi",
+        "toch chandrama nabhat": "toch chandrama nabhat marathi",
+    }
+    if lower in aliases:
+        return aliases[lower]
+    if lower.startswith("kajra") and "re" not in lower.split():
+        return "kajra re"
+    return title.strip()
+
+
+def _resolve_song_focus(message: str, history: Optional[list] = None) -> str:
+    history = history or []
+    focus = _extract_song_query_focus(message)
+    if not focus and history:
+        lower = (message or "").lower().strip()
+        if lower in ("sure", "yes", "yes please", "ok", "okay", "go ahead", "please", "do it"):
+            focus = _extract_song_query_focus((_prior_user_queries(history, 1) or [""])[-1])
+        elif _is_likely_continuation(message, history):
+            focus = _extract_song_query_focus((_prior_user_queries(history, 1) or [""])[-1])
+    return _normalize_song_title(focus or "")
+
+
+def _effective_lyrics_message(message: str, history: Optional[list] = None) -> str:
+    history = history or []
+    lower = (message or "").lower().strip()
+    if lower in ("sure", "yes", "yes please", "ok", "okay", "go ahead", "please", "do it") and history:
+        return (_prior_user_queries(history, 1) or [message])[-1]
+    return message
+
+
 def web_search_lyrics(query: str) -> str:
-    """Fast lyrics lookup — DDG HTML first (skips slow news RSS)."""
-    variants = _lyrics_search_query_variants(query)
-    best_label = ""
-    best_hits = ""
+    """Lyrics lookup — Wikipedia + optional DDG (DDG often blocked on cloud hosts)."""
+    focus = _normalize_song_title(_extract_song_query_focus(query) or query)
+    sections = []
 
-    if variants:
-        try:
-            with ThreadPoolExecutor(max_workers=min(2, len(variants))) as pool:
-                futures = {pool.submit(ddg_html_search, variant, 6): variant for variant in variants[:2]}
-                for fut in as_completed(futures, timeout=8):
-                    variant = futures[fut]
-                    try:
-                        html_hits = fut.result()
-                    except Exception:
-                        continue
-                    if html_hits and len(html_hits) > len(best_hits):
-                        best_label = variant
-                        best_hits = html_hits
-        except Exception as exc:
-            print("LYRICS PARALLEL SEARCH ERROR:", exc)
+    wiki = wikipedia_search(f"{focus} song", max_items=1)
+    if wiki:
+        sections.append(wiki)
 
-    if best_hits:
-        return f"Web lyrics snippets for '{best_label}': {best_hits}"
+    try:
+        ddg = ddg_html_search(f"{focus} lyrics", 6)
+        if ddg:
+            sections.append(f"Web snippets: {ddg}")
+    except Exception as exc:
+        print("LYRICS DDG SKIP:", exc)
 
-    for variant in variants[:2]:
-        html_hits = ddg_html_search(variant, 6)
-        if html_hits:
-            return f"Web lyrics snippets for '{variant}': {html_hits}"
-
-    return ""
-
-
-KNOWN_LYRICS_CATALOG = [
-    {
-        "id": "ubuntu_hich_amuchi_praarthana",
-        "match": (
-            "mansane", "mansashi", "manasashi", "mansasam", "hich amuchi", "hich amuuchi",
-            "prarthana", "praarthana", "ubuntu",
-        ),
-        "title": "Hich Amuchi Praarthana (Mansane Mansashi)",
-        "film": "Ubuntu (2017)",
-        "language": "Marathi",
-        "credits": "Lyrics: Sameer Samant | Music: Kaushal Inamdar | Singers: Ajit Parab & Mugdha Vaishampayan",
-        "lyrics": """हीच अमुची प्रार्थना अन् हेच अमुचे मागणे
-माणसाने माणसाशी माणसासम वागणे
-
-धर्म, जाती, प्रांत, भाषा, द्वेष सारे संपू दे
-एक निष्ठा, एक आशा, एक रंगी रंगू दे
-अन् पुन्हा पसरो मनावर शुद्धतेचे चांदणे
-माणसाने माणसाशी माणसासम वागणे
-
-भोवताली दाटला अंधार दुःखाचा जरी,
-सूर्य सत्याचा उद्या उगवेल आहे खात्री,
-तोवरी देई आम्हाला काजव्यांचे जागणे
-माणसाने माणसाशी माणसासम वागणे
-
-लाभले आयुष्य जितके ते जगावे चांगले
-पाउले चालो पुढे.. जे थांबले ते संपले
-घेतला जो श्वास आता तो पुन्हा ना लाभणे
-माणसाने माणसाशी माणसासम वागणे""",
-    },
-    {
-        "id": "lungi_dance",
-        "match": ("lungi dance", "lungi-dance"),
-        "title": "Lungi Dance (The Thalaivar Tribute)",
-        "film": "Chennai Express (2013)",
-        "language": "Hindi",
-        "credits": "Lyrics/Music/Singer: Yo Yo Honey Singh",
-        "lyrics": """Lungi.. King Khan.. Yo Yo Honey Singh!
-
-Moochhon ko thoda round ghumake
-Anna ke jaisa chashma lagake
-Coconut mein lassi milake
-Aa jao saare mood banake (x2)
-
-All the Rajini fans — Thalaivar
-Don't miss the chance — Thalaivar
-
-Lungi dance, lungi dance, lungi dance, lungi dance
-
-Jado jawaani bada jor si ve jaalma
-Main taa Rajini da fan si ve jaalma (x2)
-
-Disco mein jab ye gaana bajega
-On the floor aana padega
-Lungi ko uthana padega
-Step karke dikhana padega (x2)
-
-Night club mein aaya main toh
-Mujhko rokega kaun aur kaiko
-Mera mood mein dance karega
-Kisika daddy se nahi darega
-
-Jisko jo bhi hai karna wo kar lo
-Idhar hi hoon main khada pakad lo
-Ghar pe jaake tum Google kar lo
-Mere baare mein Wikipedia pe padh lo
-
-Kon mujhsa hai kon
-Oh baby yes I am a don
-Nahi milega mujhsa, go find it
-Don't angry me, mind it!
-
-Arey mere jaise dance kisko aata hai
-Choreographer ko main hi sikhata hai
-Woh ghar pe aata hai
-Mujhse seekh ke jaata hai
-Mujhse seekh ke woh logon ko sikhata hai""",
-    },
-    {
-        "id": "jana_gana_mana",
-        "match": ("jan gan man", "jana gana mana", "janaganamana", "jana-gana-mana"),
-        "title": "Jana Gana Mana",
-        "film": "National Anthem of India",
-        "language": "Hindi/Sanskrit",
-        "credits": "Lyrics: Rabindranath Tagore | Composer: Rabindranath Tagore",
-        "lyrics": """Jana-gana-mana-adhinayaka jaya he
-Bharata-bhagya-vidhata
-Punjab-Sindhu-Gujarata-Maratha
-Dravida-Utkala-Banga
-Vindhya-Himachala-Yamuna-Ganga
-Uchchhala-jaladhi-taranga
-Tava shubha name jage
-Tava shubha asisha mage
-Gahe tava jaya-gatha
-Jana-gana-mangala-dayaka jaya he
-Bharata-bhagya-vidhata
-Jaya he, jaya he, jaya he
-Jaya jaya jaya, jaya he""",
-    },
-]
+    return " || ".join(sections) if sections else ""
 
 
 def _extract_song_query_focus(message: str) -> str:
@@ -1757,218 +1691,196 @@ def _message_names_new_song(message: str, history: Optional[list]) -> bool:
     return not (current_words & prior_words)
 
 
-def _score_lyrics_catalog_entry(entry: dict, text: str) -> int:
-    """Score how well the current user text matches a catalog song (higher = better)."""
-    lower = (text or "").lower()
-    if not lower:
-        return 0
-
-    score = 0
-    for token in entry["match"]:
-        if " " in token and token in lower:
-            score += 12 + len(token)
-        elif token in lower:
-            score += 5
-
-    if entry["id"] == "lungi_dance":
-        if "lungi dance" in lower or "lungi-dance" in lower:
-            score += 8
-        elif "lungi" in lower and "dance" in lower:
-            score += 6
-        else:
-            return 0
-
-    if entry["id"] == "ubuntu_hich_amuchi_praarthana":
-        strong = ("ubuntu", "mansane", "mansashi", "manasashi", "mansasam", "hich amuchi", "prarthana", "praarthana")
-        if not any(token in lower for token in strong):
-            return 0
-
-    if entry["id"] == "jana_gana_mana":
-        if not any(token in lower for token in entry["match"]):
-            return 0
-
-    return score
-
-
-def _lookup_known_lyrics(message: str, history: Optional[list] = None) -> Optional[dict]:
-    """Return curated lyrics only when the current message clearly names the song."""
+def _lyrics_search_query(message: str, history: Optional[list] = None) -> str:
+    """Build a web search query for lyrics using only the relevant song context."""
     history = history or []
-    current = (message or "").strip()
-    best_entry = None
-    best_score = 0
-
-    for entry in KNOWN_LYRICS_CATALOG:
-        score = _score_lyrics_catalog_entry(entry, current)
-        if score > best_score:
-            best_score = score
-            best_entry = entry
-
-    if best_entry and best_score >= 5:
-        return best_entry
-
-    # Reuse prior song only for generic follow-ups like "full lyrics" — not a new song title
-    focus = _extract_song_query_focus(current)
-    generic_followup = not focus or focus in ("more", "rest", "all", "continue")
-    if generic_followup and history and _is_likely_continuation(current, history):
-        prior_query = (_prior_user_queries(history, 1) or [""])[-1]
-        for entry in KNOWN_LYRICS_CATALOG:
-            score = _score_lyrics_catalog_entry(entry, prior_query)
-            if score > best_score:
-                best_score = score
-                best_entry = entry
-        if best_entry and best_score >= 5:
-            return best_entry
-
-    return None
+    focus = _extract_song_query_focus(message)
+    if not focus and history and _is_likely_continuation(message, history):
+        focus = _extract_song_query_focus((_prior_user_queries(history, 1) or [""])[-1])
+    if focus:
+        return f"{focus} lyrics"
+    if _message_names_new_song(message, history):
+        q = message.strip()
+    else:
+        q = _build_live_search_query(message, history)
+    return q if "lyrics" in q.lower() else f"{q} lyrics"
 
 
-def _format_known_lyrics(entry: dict, user_query: str) -> str:
-    return (
-        f"**{entry['title']}** — *{entry['film']}*\n\n"
-        f"{entry['lyrics']}\n\n"
-        f"*{entry['credits']}*"
+def _is_lyrics_refusal(text: str) -> bool:
+    lower = (text or "").lower()
+    refusal_phrases = (
+        "sorry, i can't",
+        "sorry, i cannot",
+        "i'm sorry, i cannot",
+        "i am sorry, i cannot",
+        "can't provide the full lyrics",
+        "cannot provide the full lyrics",
+        "can't provide the lyrics",
+        "cannot provide the lyrics",
+        "don't have the lyrics",
+        "do not have the lyrics",
+        "unable to provide",
+        "unable to retrieve",
+        "how about i summarize",
+        "can't do that",
+        "cannot do that",
+        "i don't have the exact lyrics",
+        "i do not have the exact lyrics",
+        "i don't have the lyrics",
+        "i do not have the lyrics",
     )
+    return any(phrase in lower for phrase in refusal_phrases)
 
 
-def _search_has_lyrics_content(search_data: str) -> bool:
+def _parse_search_snippets(search_data: str) -> List[str]:
     if not search_data:
-        return False
-    lower = search_data.lower()
-    if "no lyrics" in lower or "timed out" in lower or "search failed" in lower:
-        return False
-    markers = (
-        "lyrics snippets", "dharm", "jaati", "jati", "prant", "mansane", "prarthana",
-        "praarthana", "mansasam", "lungi dance", "honey singh", "moochhon", "moonchon",
-        "माणसाने", "हीच अमुची", "prayer song",
-    )
-    return any(m in lower for m in markers)
+        return []
+    payload = search_data
+    for prefix in ("Web snippets: ", "Web lyrics snippets for '", "Web lyrics snippets: ", "Wikipedia — "):
+        payload = payload.replace(prefix, " ")
+    payload = payload.replace(" || ", " | ")
+    lines = [s.strip() for s in re.split(r"\s*\|\s*", payload) if s.strip()]
+    unique = []
+    for line in lines:
+        if line not in unique and len(line) > 10:
+            unique.append(line)
+    return unique
 
 
 def _snippet_looks_like_lyrics(text: str) -> bool:
+    if re.search(r"[\u0900-\u097F]{12,}", text or ""):
+        return True
     lower = (text or "").lower()
-    lyric_markers = (
-        "dharm", "jaati", "jati", "prant", "mansaane", "mansane", "moochhon", "moonchon",
-        "lungi ko", "disco mein", "माणसाने", "हीच", "प्रार्थना", "prarthana",
-    )
-    if any(m in lower for m in lyric_markers):
+    if any(ch in text for ch in ("…", "...", " - ", " – ")) and len(text) > 40:
         return True
-    if re.search(r"[\u0900-\u097F]{20,}", text or ""):
+    lyric_hints = ("verse", "stanza", "chorus", "lyric", "singer", "composed", "written by")
+    if any(h in lower for h in lyric_hints) and len(text) > 50:
         return True
+    if len(text) > 30 and text.count("http") == 0 and text.count(".") < 6:
+        if len(text.split()) >= 5:
+            return True
     return False
 
 
-def _format_lyrics_from_search(search_data: str, user_query: str) -> Optional[str]:
-    """Build a lyrics reply directly from web snippets when the model would otherwise refuse."""
-    if not _search_has_lyrics_content(search_data):
+def _format_lyrics_from_search(search_data: str, song_focus: str) -> Optional[str]:
+    """Format web search snippets into a lyrics-style reply."""
+    snippets = _parse_search_snippets(search_data)
+    if not snippets:
         return None
 
-    payload = search_data
-    for prefix in ("[Real-time Search Data: ", "Web lyrics snippets for '", "Web lyrics snippets: "):
-        if prefix in payload:
-            payload = payload.split(prefix, 1)[-1]
-    payload = payload.rstrip("]").strip()
-
-    snippets = payload
-    if "': " in snippets:
-        snippets = snippets.split("': ", 1)[-1]
-
-    lines = [s.strip() for s in re.split(r"\s*\|\s*", snippets) if s.strip()]
-    lyric_lines = [line for line in lines if _snippet_looks_like_lyrics(line)]
-    unique_lines = []
-    for line in (lyric_lines or lines):
-        if line not in unique_lines and len(line) > 12:
-            unique_lines.append(line)
-
-    if not unique_lines or not any(_snippet_looks_like_lyrics(line) for line in unique_lines):
-        return None
-
-    body = "\n\n".join(unique_lines[:6])
+    lyricish = [s for s in snippets if _snippet_looks_like_lyrics(s)]
+    chosen = lyricish if lyricish else snippets
+    body = "\n\n".join(chosen[:8])
+    title = song_focus or "your song"
     lang_hint = "Marathi" if re.search(r"[\u0900-\u097F]", body) else "Hindi/English"
     return (
-        f"Here are the **{lang_hint} lyrics** I found for your request:\n\n"
+        f"**{title.title()}** — lyrics from web search ({lang_hint}):\n\n"
         f"{body}\n\n"
-        "*Source: web search snippets. For the complete song, check the official music video or lyric sites.*"
+        "*Compiled from public web snippets. If any line looks incomplete, say the movie/artist name and I will search again.*"
     )
 
 
-async def _resolve_lyrics_reply(message: str, history: Optional[list], timeout: float = 5.0) -> Optional[str]:
-    """Fast lyrics resolution: catalog → web snippets → dedicated LLM call."""
-    lookup_history = None if _message_names_new_song(message, history) else history
-    known = _lookup_known_lyrics(message, lookup_history)
-    if known:
-        print(f"🎵 LYRICS FAST: known catalog match -> {known['id']}")
-        return _format_known_lyrics(known, message)
-
-    if _message_names_new_song(message, history):
-        search_q = message.strip()
-        if "lyrics" not in search_q.lower():
-            search_q = f"{search_q} lyrics"
-    else:
-        search_q = _build_live_search_query(message, history)
-
-    try:
-        search_data = await asyncio.wait_for(
-            asyncio.to_thread(web_search_lyrics, search_q),
-            timeout=timeout,
-        )
-    except asyncio.TimeoutError:
-        print("LYRICS SEARCH TIMEOUT:", search_q[:120])
-        search_data = ""
-
-    formatted = _format_lyrics_from_search(search_data, message)
+def _format_best_effort_lyrics(message: str, search_data: str, song_focus: str) -> str:
+    formatted = _format_lyrics_from_search(search_data, song_focus)
     if formatted:
-        print("🎵 LYRICS FAST: web snippets formatted")
         return formatted
+    title = song_focus or _extract_song_query_focus(message) or message.strip()
+    if search_data and len(search_data.strip()) > 40:
+        snippets = _parse_search_snippets(search_data)
+        body = "\n\n".join(f"- {s}" for s in snippets[:6])
+        return (
+            f"Here is what I found for **{title}**:\n\n{body}\n\n"
+            "*Could not verify full lyrics from search alone. Share the movie/album or singer if you have it.*"
+        )
+    return (
+        f"I searched for **{title}** but could not fetch lyrics right now.\n\n"
+        "Please try again with the **movie/album or singer name**, or check YouTube / JioSaavn / Google for the official audio."
+    )
 
-    print("🎵 LYRICS FAST: falling back to LLM for:", message[:80])
-    return await _resolve_lyrics_via_llm(message)
 
-
-async def _resolve_lyrics_via_llm(message: str) -> Optional[str]:
-    """Direct LLM lyrics lookup — used when catalog/web search miss."""
+async def _resolve_lyrics_via_llm(message: str, search_data: str, song_focus: str) -> Optional[str]:
+    """LLM lyrics lookup — primary source for any song title."""
     try:
         ai_client = get_github_models_client()
+        context_block = search_data.strip() if search_data else ""
+        song_label = song_focus or _extract_song_query_focus(message) or message
 
         def _call():
+            user_parts = [
+                f"Give me the full lyrics for this song: **{song_label}**",
+                f"Original request: {message}",
+            ]
+            if context_block:
+                user_parts.append(f"Reference data from web:\n{context_block}")
+            user_parts.append(
+                "Write every verse and chorus you know for THIS song only. "
+                "Use the song's original language (Marathi/Hindi/etc.) where appropriate. "
+                "Format with Markdown."
+            )
+
             return ai_client.complete(
                 messages=[
                     {
                         "role": "system",
                         "content": (
-                            "You provide song lyrics. Give the full lyrics for the exact song the user named. "
-                            "Never return lyrics from a different song. Use Markdown. "
-                            "If you do not know that exact song, say so clearly."
+                            "You are Nova AI, a helpful assistant that provides song lyrics when users ask.\n"
+                            "When a user names a song, output the lyrics for that exact song.\n"
+                            "Use your knowledge of published songs. Never swap in a different song.\n"
+                            "Be helpful — provide the fullest lyrics you can. Do not refuse or offer only metadata."
                         ),
                     },
-                    {"role": "user", "content": message},
+                    {"role": "user", "content": "\n\n".join(user_parts)},
                 ],
                 model="gpt-4o",
-                connection_timeout=10,
-                read_timeout=25,
+                connection_timeout=12,
+                read_timeout=28,
             )
 
-        response = await asyncio.wait_for(asyncio.to_thread(_call), timeout=32.0)
+        response = await asyncio.wait_for(asyncio.to_thread(_call), timeout=35.0)
         if not response or not getattr(response, "choices", None):
             return None
         content = (response.choices[0].message.content or "").strip()
-        if len(content) < 40:
-            return None
-        lower = content.lower()
-        if any(
-            phrase in lower
-            for phrase in (
-                "unable to retrieve",
-                "can't provide the full lyrics",
-                "cannot provide the full lyrics",
-                "don't have the full lyrics",
-                "do not have the full lyrics",
-            )
-        ):
+        if len(content) < 30 or _is_lyrics_refusal(content):
             return None
         return content
     except Exception as exc:
         print("LYRICS LLM ERROR:", exc)
         return None
+
+
+async def _resolve_lyrics_reply(message: str, history: Optional[list], timeout: float = 6.0) -> str:
+    """Global lyrics handler for ANY song: LLM first, then web, always returns an answer."""
+    song_focus = _resolve_song_focus(message, history)
+    effective = _effective_lyrics_message(message, history)
+
+    search_data = ""
+    search_task = asyncio.create_task(
+        asyncio.to_thread(web_search_lyrics, f"{song_focus or effective} lyrics")
+    )
+    llm_task = asyncio.create_task(_resolve_lyrics_via_llm(effective, "", song_focus))
+
+    try:
+        search_data = await asyncio.wait_for(search_task, timeout=timeout)
+    except asyncio.TimeoutError:
+        search_task.cancel()
+
+    llm_reply = await llm_task
+    if llm_reply:
+        print("🎵 LYRICS: LLM")
+        return llm_reply
+
+    if search_data:
+        llm_with_search = await _resolve_lyrics_via_llm(effective, search_data, song_focus)
+        if llm_with_search:
+            print("🎵 LYRICS: LLM + web context")
+            return llm_with_search
+        formatted = _format_lyrics_from_search(search_data, song_focus)
+        if formatted:
+            print("🎵 LYRICS: web snippets")
+            return formatted
+
+    print("🎵 LYRICS: best-effort for:", (song_focus or message)[:80])
+    return _format_best_effort_lyrics(effective, search_data, song_focus)
 
 
 def wikipedia_search(query: str, max_items: int = 2) -> str:
@@ -2404,30 +2316,29 @@ async def run_chat_message(
         live_search_query = _build_live_search_query(message, recent_history)
         print(f"🧠 CHAT INTENT: {query_intent}, upload_focused={upload_focused_query}, include_history={include_history}, live_query='{live_search_query[:120]}'")
 
-        # Fast path: song lyrics — return immediately without RAG/LLM (much faster on Render)
-        if _is_song_lyrics_query(message) and not files:
-            lyrics_fast = await _resolve_lyrics_reply(message, recent_history, timeout=5.0)
-            if lyrics_fast:
-                sources = [{"source": "Nova lyrics lookup", "page": None, "score": None}]
-                chat_doc = {
-                    "user_email": user_email,
-                    "user_query": message,
-                    "ai_response": lyrics_fast,
-                    "embedding": [],
-                    "session_id": session_id,
-                    "timestamp": datetime.utcnow(),
-                    "sources": sources,
-                    "real_time_context": "",
-                    "rag_context": "",
-                }
-                try:
-                    await db.chat_history.insert_one(chat_doc)
-                except Exception as e:
-                    print(f"CHAT HISTORY SAVE ERROR: {e}")
-                response_payload = {"reply": lyrics_fast, "sources": sources}
-                if session_id:
-                    response_payload["session_id"] = session_id
-                return response_payload
+        # Global lyrics path — always answer here (web search + LLM), never fall through to blocking prompts
+        if _is_lyrics_request(message, recent_history) and not files:
+            lyrics_fast = await _resolve_lyrics_reply(message, recent_history, timeout=10.0)
+            sources = [{"source": "Lyrics lookup (web + AI)", "page": None, "score": None}]
+            chat_doc = {
+                "user_email": user_email,
+                "user_query": message,
+                "ai_response": lyrics_fast,
+                "embedding": [],
+                "session_id": session_id,
+                "timestamp": datetime.utcnow(),
+                "sources": sources,
+                "real_time_context": "",
+                "rag_context": "",
+            }
+            try:
+                await db.chat_history.insert_one(chat_doc)
+            except Exception as e:
+                print(f"CHAT HISTORY SAVE ERROR: {e}")
+            response_payload = {"reply": lyrics_fast, "sources": sources}
+            if session_id:
+                response_payload["session_id"] = session_id
+            return response_payload
 
         is_equity_query = any(
             word in message_lower
@@ -2511,7 +2422,9 @@ async def run_chat_message(
                     search_data = "Real-time search timed out. Please try again."
             real_time_context = f"\n[{get_current_info()}]\n[Real-time Search Data: {search_data}]"
             if _is_song_lyrics_query(message):
-                lyrics_direct = _format_lyrics_from_search(search_data, message)
+                lyrics_direct = _format_lyrics_from_search(
+                    search_data, _extract_song_query_focus(message) or message
+                )
         
         # Build conversation context
         system_prompt = f"""You are a helpful AI assistant with access to real-time information and optional uploaded document context.
