@@ -131,6 +131,8 @@ async def lifespan(app: FastAPI):
     await verify_neo4j_connection()
     try:
         await ensure_admin_user()
+        await _ensure_admin_indexes()
+        await _backfill_auth_history()
     except Exception as exc:
         print("ADMIN SEED WARNING:", exc)
     yield
@@ -2310,6 +2312,135 @@ def require_admin(user=Depends(get_current_user)):
     return user
 
 
+def _utc_day_bounds(days_ago: int = 0):
+    """UTC midnight window. days_ago=0 today, 1 yesterday."""
+    now = datetime.utcnow()
+    day_start = datetime(now.year, now.month, now.day) - timedelta(days=days_ago)
+    return day_start, day_start + timedelta(days=1)
+
+
+def _parse_optional_date(value: Optional[str]) -> Optional[datetime]:
+    if not value or not str(value).strip():
+        return None
+    try:
+        return datetime.strptime(str(value).strip()[:10], "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date. Use YYYY-MM-DD.")
+
+
+def _admin_date_filter(period: Optional[str], since: Optional[str], until: Optional[str], field: str = "created_at") -> dict:
+    """Build Mongo date range for admin filters."""
+    period = (period or "").strip().lower()
+    if period == "today":
+        start, end = _utc_day_bounds(0)
+        return {field: {"$gte": start, "$lt": end}}
+    if period == "yesterday":
+        start, end = _utc_day_bounds(1)
+        return {field: {"$gte": start, "$lt": end}}
+    if period in ("7days", "week", "last7"):
+        return {field: {"$gte": datetime.utcnow() - timedelta(days=7)}}
+
+    since_dt = _parse_optional_date(since)
+    until_dt = _parse_optional_date(until)
+    if not since_dt and not until_dt:
+        return {}
+
+    rng = {}
+    if since_dt:
+        rng["$gte"] = since_dt
+    if until_dt:
+        rng["$lt"] = until_dt + timedelta(days=1)
+    return {field: rng}
+
+
+def _admin_user_activity_filter(period: Optional[str], since: Optional[str], until: Optional[str]) -> dict:
+    """Match users who signed up or logged in during the selected window."""
+    created = _admin_date_filter(period, since, until, "created_at")
+    if not created:
+        return {}
+    logged_in = _admin_date_filter(period, since, until, "last_login_at")
+    return {"$or": [created, logged_in]}
+
+
+def _format_admin_datetime(value) -> Optional[str]:
+    if not value:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
+async def record_auth_event(email: str, event: str, auth_provider: str, username: str = ""):
+    """Track sign-up and login events for the admin dashboard."""
+    email = (email or "").strip().lower()
+    if not email:
+        return
+    now = datetime.utcnow()
+    try:
+        await db.login_events.insert_one({
+            "email": email,
+            "username": username or "",
+            "event": event,
+            "auth_provider": auth_provider or "email",
+            "created_at": now,
+        })
+        if event in ("register", "google_register"):
+            await db["users"].update_one(
+                {"email": email},
+                {"$set": {"last_login_at": now, "login_count": 1}},
+            )
+        else:
+            await db["users"].update_one(
+                {"email": email},
+                {"$set": {"last_login_at": now}, "$inc": {"login_count": 1}},
+            )
+    except Exception as exc:
+        print("AUTH EVENT LOG ERROR:", exc)
+
+
+async def _ensure_admin_indexes():
+    try:
+        await db.login_events.create_index([("created_at", -1)])
+        await db.login_events.create_index([("email", 1)])
+        await db["users"].create_index([("created_at", -1)])
+        await db["users"].create_index([("last_login_at", -1)])
+    except Exception as exc:
+        print("ADMIN INDEX WARNING:", exc)
+
+
+async def _backfill_auth_history():
+    """Seed register events and last_login_at for users created before login tracking."""
+    try:
+        async for user in db["users"].find({}):
+            email = (user.get("email") or "").strip().lower()
+            if not email:
+                continue
+            event = "google_register" if user.get("auth_provider") == "google" else "register"
+            exists = await db.login_events.find_one({
+                "email": email,
+                "event": {"$in": ["register", "google_register"]},
+            })
+            if not exists:
+                created = user.get("created_at") or datetime.utcnow()
+                await db.login_events.insert_one({
+                    "email": email,
+                    "username": user.get("username") or "",
+                    "event": event,
+                    "auth_provider": user.get("auth_provider") or "email",
+                    "created_at": created,
+                })
+            if not user.get("last_login_at") and user.get("created_at"):
+                await db["users"].update_one(
+                    {"email": email},
+                    {
+                        "$set": {
+                            "last_login_at": user.get("created_at"),
+                            "login_count": user.get("login_count") or 1,
+                        }
+                    },
+                )
+    except Exception as exc:
+        print("AUTH BACKFILL WARNING:", exc)
 
 
 @app.post("/chat/upload")
@@ -3539,6 +3670,7 @@ async def register_user(user: UserRegister):
         }
 
         await db["users"].insert_one(new_user)
+        await record_auth_event(email, "register", "email", user.username)
         token = create_access_token({"email": email})
         return _auth_response(new_user, token)
     except HTTPException:
@@ -3653,6 +3785,7 @@ async def google_auth(payload: GoogleAuthRequest):
             "created_at": datetime.utcnow(),
         }
         await db["users"].insert_one(new_user)
+        await record_auth_event(email, "google_register", "google", username)
     else:
         patch = {"auth_provider": existing_user.get("auth_provider") or "google"}
         if avatar_url:
@@ -3662,6 +3795,7 @@ async def google_auth(payload: GoogleAuthRequest):
         if not existing_user.get("username"):
             patch["username"] = username
         await db["users"].update_one({"email": email}, {"$set": patch})
+        await record_auth_event(email, "google_login", "google", username)
         existing_user = await db["users"].find_one({"email": email})
         username = existing_user.get("username") or username
 
@@ -3685,6 +3819,8 @@ def _serialize_user(doc: dict) -> dict:
         "auth_provider": doc.get("auth_provider") or "email",
         "avatar_url": doc.get("avatar_url"),
         "created_at": doc.get("created_at"),
+        "last_login_at": doc.get("last_login_at"),
+        "login_count": doc.get("login_count") or 0,
         "is_admin": _is_admin_email(email) or bool(doc.get("is_admin")),
     }
 
@@ -3786,6 +3922,13 @@ async def login_user_safe(user: UserLogin):
 
         token = create_access_token({"email": email})
 
+        await record_auth_event(
+            email,
+            "login",
+            existing_user.get("auth_provider") or "email",
+            existing_user.get("username") or "",
+        )
+        existing_user = await db["users"].find_one({"email": email})
         return _auth_response(existing_user, token)
     except HTTPException:
         raise
@@ -3808,30 +3951,84 @@ async def admin_overview(_admin=Depends(require_admin)):
             {"auth_provider": "email"},
         ]
     })
+
+    t_start, t_end = _utc_day_bounds(0)
+    y_start, y_end = _utc_day_bounds(1)
+
+    registrations_today = await db["users"].count_documents({"created_at": {"$gte": t_start, "$lt": t_end}})
+    registrations_yesterday = await db["users"].count_documents({"created_at": {"$gte": y_start, "$lt": y_end}})
+    logins_today = await db.login_events.count_documents({"created_at": {"$gte": t_start, "$lt": t_end}})
+    logins_yesterday = await db.login_events.count_documents({"created_at": {"$gte": y_start, "$lt": y_end}})
+
     return {
         "total_users": total_users,
         "total_chats": total_chats,
         "google_users": google_users,
         "email_users": email_users,
+        "registrations_today": registrations_today,
+        "registrations_yesterday": registrations_yesterday,
+        "logins_today": logins_today,
+        "logins_yesterday": logins_yesterday,
     }
 
 
 @app.get("/admin/users")
-async def admin_users(email: Optional[str] = None, _admin=Depends(require_admin)):
+async def admin_users(
+    email: Optional[str] = None,
+    period: Optional[str] = None,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+    _admin=Depends(require_admin),
+):
     query = {}
     if email and email.strip():
         query["email"] = {"$regex": re.escape(email.strip()), "$options": "i"}
+    activity_filter = _admin_user_activity_filter(period, since, until)
+    if activity_filter:
+        if query:
+            query = {"$and": [query, activity_filter]}
+        else:
+            query = activity_filter
 
     rows = []
-    async for doc in db["users"].find(query).sort("created_at", -1):
+    async for doc in db["users"].find(query).sort([("created_at", -1), ("last_login_at", -1)]):
         user_email = doc.get("email") or ""
         chat_count = await db.chat_history.count_documents({"user_email": user_email})
         profile = _serialize_user(doc)
         profile["chat_count"] = chat_count
-        if profile.get("created_at"):
-            profile["created_at"] = profile["created_at"].isoformat() if hasattr(profile["created_at"], "isoformat") else profile["created_at"]
+        profile["created_at"] = _format_admin_datetime(profile.get("created_at"))
+        profile["last_login_at"] = _format_admin_datetime(profile.get("last_login_at"))
         rows.append(profile)
     return {"users": rows}
+
+
+@app.get("/admin/logins")
+async def admin_logins(
+    email: Optional[str] = None,
+    period: Optional[str] = None,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+    limit: int = 200,
+    _admin=Depends(require_admin),
+):
+    safe_limit = max(1, min(limit, 500))
+    query = {}
+    if email and email.strip():
+        query["email"] = {"$regex": re.escape(email.strip()), "$options": "i"}
+    query.update(_admin_date_filter(period, since, until, "created_at"))
+
+    rows = []
+    cursor = db.login_events.find(query).sort("created_at", -1).limit(safe_limit)
+    async for doc in cursor:
+        rows.append({
+            "_id": str(doc.get("_id")),
+            "email": doc.get("email") or "",
+            "username": doc.get("username") or "",
+            "event": doc.get("event") or "",
+            "auth_provider": doc.get("auth_provider") or "",
+            "created_at": _format_admin_datetime(doc.get("created_at")),
+        })
+    return {"logins": rows, "count": len(rows)}
 
 
 @app.delete("/admin/users")
@@ -3867,11 +4064,19 @@ async def admin_delete_user(email: str, admin=Depends(require_admin)):
 
 
 @app.get("/admin/chats")
-async def admin_chats(limit: int = 100, email: Optional[str] = None, _admin=Depends(require_admin)):
+async def admin_chats(
+    limit: int = 100,
+    email: Optional[str] = None,
+    period: Optional[str] = None,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+    _admin=Depends(require_admin),
+):
     safe_limit = max(1, min(limit, 500))
     query = {}
     if email and email.strip():
         query["user_email"] = {"$regex": re.escape(email.strip()), "$options": "i"}
+    query.update(_admin_date_filter(period, since, until, "timestamp"))
 
     cursor = db.chat_history.find(query).sort("timestamp", -1).limit(safe_limit)
     chats = []
