@@ -1761,6 +1761,12 @@ button, input, textarea { font: inherit; }
   font-size: 0.9rem;
 }
 
+.admin-topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
 .admin-search-bar {
   margin-bottom: 1rem;
   padding: 0.95rem 1.1rem;

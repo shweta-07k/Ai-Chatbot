@@ -58,10 +58,10 @@ export default function AdminDashboard() {
     return () => clearTimeout(timer);
   }, [searchEmail]);
 
-  const buildQuery = useCallback((emailQuery, extra = "") => {
+  const buildQuery = useCallback((emailQuery, extra = "", { includePeriod = true } = {}) => {
     const params = new URLSearchParams();
     if (emailQuery) params.set("email", emailQuery);
-    if (period) params.set("period", period);
+    if (includePeriod && period) params.set("period", period);
     if (extra) {
       extra.split("&").forEach((pair) => {
         const [key, val] = pair.split("=");
@@ -74,34 +74,50 @@ export default function AdminDashboard() {
 
   const loadAdminData = useCallback(async (emailQuery = "") => {
     const token = getAuthToken();
-    const userQuery = buildQuery(emailQuery);
+    const userQuery = buildQuery(emailQuery, "", { includePeriod: false });
     const chatQuery = buildQuery(emailQuery, "limit=200");
     const loginQuery = buildQuery(emailQuery, "limit=300");
 
     setLoading(true);
     setError("");
-    try {
-      const [stats, userRows, loginRows, chatRows] = await Promise.all([
-        apiRequest("/admin/overview", { token }),
-        apiRequest(`/admin/users${userQuery}`, { token }),
-        apiRequest(`/admin/logins${loginQuery}`, { token }),
-        apiRequest(`/admin/chats${chatQuery}`, { token }),
-      ]);
-      setOverview(stats);
-      setUsers(Array.isArray(userRows?.users) ? userRows.users : []);
-      setLogins(Array.isArray(loginRows?.logins) ? loginRows.logins : []);
-      setChats(Array.isArray(chatRows?.chats) ? chatRows.chats : []);
-    } catch (err) {
-      setError(friendlyChatError(err));
-    } finally {
-      setLoading(false);
+    const partialErrors = [];
+
+    const safeRequest = async (path, fallback) => {
+      try {
+        return await apiRequest(path, { token });
+      } catch (err) {
+        partialErrors.push(friendlyChatError(err));
+        return fallback;
+      }
+    };
+
+    const [stats, userRows, loginRows, chatRows] = await Promise.all([
+      safeRequest("/admin/overview", null),
+      safeRequest(`/admin/users${userQuery}`, { users: [], count: 0 }),
+      safeRequest(`/admin/logins${loginQuery}`, { logins: [], count: 0 }),
+      safeRequest(`/admin/chats${chatQuery}`, { chats: [] }),
+    ]);
+
+    if (stats) setOverview(stats);
+    setUsers(Array.isArray(userRows?.users) ? userRows.users : []);
+    setLogins(Array.isArray(loginRows?.logins) ? loginRows.logins : []);
+    setChats(Array.isArray(chatRows?.chats) ? chatRows.chats : []);
+
+    if (!stats && userRows.users.length === 0) {
+      setError(partialErrors[0] || "Could not load admin dashboard.");
+    } else if (partialErrors.length) {
+      setError(partialErrors.join(" "));
     }
+
+    setLoading(false);
   }, [buildQuery]);
 
   useEffect(() => {
     if (!isAuthenticated || !user?.is_admin) return;
     loadAdminData(debouncedSearch);
   }, [isAuthenticated, user?.is_admin, debouncedSearch, period, loadAdminData]);
+
+  const handleRefresh = () => loadAdminData(debouncedSearch);
 
   const handleDeleteUser = async (row) => {
     const targetEmail = row.email;
@@ -151,7 +167,12 @@ export default function AdminDashboard() {
           <h1>Admin Dashboard</h1>
           <p>Signed in as {user.email}</p>
         </div>
-        <Link to="/" className="btn btn-secondary">Back to chat</Link>
+        <div className="admin-topbar-actions">
+          <button type="button" className="btn btn-ghost" onClick={handleRefresh} disabled={loading}>
+            Refresh
+          </button>
+          <Link to="/" className="btn btn-secondary">Back to chat</Link>
+        </div>
       </header>
 
       <div className="admin-search-bar">
@@ -188,7 +209,7 @@ export default function AdminDashboard() {
           </p>
         ) : (
           <p className="admin-search-hint">
-            Showing <strong>{periodLabel}</strong> — use the <strong>Logins</strong> tab for full sign-in history.
+            <strong>Users</strong> lists every account (email + Google). <strong>Time period</strong> filters Logins and Chats only.
           </p>
         )}
       </div>
@@ -227,7 +248,7 @@ export default function AdminDashboard() {
 
           <div className="admin-tabs">
             <button type="button" className={tab === "users" ? "active" : ""} onClick={() => setTab("users")}>
-              Users ({users.length})
+              Users ({overview?.total_users ?? users.length})
             </button>
             <button type="button" className={tab === "logins" ? "active" : ""} onClick={() => setTab("logins")}>
               Logins ({logins.length})

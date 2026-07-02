@@ -83,6 +83,24 @@ def _google_client_id() -> str:
 def _is_admin_email(email: str) -> bool:
     return (email or "").strip().lower() in ADMIN_EMAILS
 
+
+def _normalize_email(email: str) -> str:
+    return (email or "").strip().lower()
+
+
+def _email_lookup_filter(email: str) -> dict:
+    normalized = _normalize_email(email)
+    if not normalized:
+        return {}
+    return {"email": {"$regex": f"^{re.escape(normalized)}$", "$options": "i"}}
+
+
+def _object_id_timestamp(doc: dict) -> datetime:
+    oid = doc.get("_id")
+    if isinstance(oid, ObjectId):
+        return oid.generation_time.replace(tzinfo=None)
+    return datetime.utcnow()
+
 # Lazy-load embedder so app can still start if HF/model download is unavailable
 embed_model = None
 embed_model_failed = False
@@ -2386,12 +2404,12 @@ async def record_auth_event(email: str, event: str, auth_provider: str, username
         })
         if event in ("register", "google_register"):
             await db["users"].update_one(
-                {"email": email},
+                _email_lookup_filter(email),
                 {"$set": {"last_login_at": now, "login_count": 1}},
             )
         else:
             await db["users"].update_one(
-                {"email": email},
+                _email_lookup_filter(email),
                 {"$set": {"last_login_at": now}, "$inc": {"login_count": 1}},
             )
     except Exception as exc:
@@ -2409,32 +2427,45 @@ async def _ensure_admin_indexes():
 
 
 async def _backfill_auth_history():
-    """Seed register events and last_login_at for users created before login tracking."""
+    """Seed register events, normalize emails, and repair missing profile dates."""
     try:
         async for user in db["users"].find({}):
-            email = (user.get("email") or "").strip().lower()
+            email_raw = (user.get("email") or "").strip()
+            email = _normalize_email(email_raw)
             if not email:
                 continue
-            event = "google_register" if user.get("auth_provider") == "google" else "register"
+
+            fixes = {}
+            if email_raw != email:
+                fixes["email"] = email
+            created = user.get("created_at")
+            if not created:
+                created = _object_id_timestamp(user)
+                fixes["created_at"] = created
+            if not user.get("auth_provider"):
+                fixes["auth_provider"] = "google" if user.get("google_id") else "email"
+            if fixes:
+                await db["users"].update_one({"_id": user["_id"]}, {"$set": fixes})
+
+            event = "google_register" if (user.get("auth_provider") == "google" or fixes.get("auth_provider") == "google") else "register"
             exists = await db.login_events.find_one({
                 "email": email,
                 "event": {"$in": ["register", "google_register"]},
             })
             if not exists:
-                created = user.get("created_at") or datetime.utcnow()
                 await db.login_events.insert_one({
                     "email": email,
                     "username": user.get("username") or "",
                     "event": event,
-                    "auth_provider": user.get("auth_provider") or "email",
+                    "auth_provider": user.get("auth_provider") or fixes.get("auth_provider") or "email",
                     "created_at": created,
                 })
-            if not user.get("last_login_at") and user.get("created_at"):
+            if not user.get("last_login_at"):
                 await db["users"].update_one(
-                    {"email": email},
+                    {"_id": user["_id"]},
                     {
                         "$set": {
-                            "last_login_at": user.get("created_at"),
+                            "last_login_at": created,
                             "login_count": user.get("login_count") or 1,
                         }
                     },
@@ -3654,7 +3685,7 @@ async def register_user(user: UserRegister):
     try:
         email = user.email.strip().lower()
         # 1. Check if email already exists in MongoDB
-        existing_user = await db["users"].find_one({"email": email})
+        existing_user = await db["users"].find_one(_email_lookup_filter(email))
         if existing_user:
             raise HTTPException(status_code=400, detail="An account with this email already exists. Please log in instead.")
 
@@ -3711,7 +3742,7 @@ async def _google_profile_from_access_token(access_token: str) -> dict:
     if not email:
         raise HTTPException(status_code=400, detail="Google did not provide an email address.")
     return {
-        "email": email,
+        "email": _normalize_email(email),
         "username": data.get("name") or email.split("@")[0],
         "avatar_url": data.get("picture"),
         "google_id": data.get("sub"),
@@ -3760,7 +3791,7 @@ async def google_auth(payload: GoogleAuthRequest):
             print(f"GOOGLE AUD MISMATCH: expected={google_client_id[:12]}... got={token_aud[:12]}...")
             raise HTTPException(status_code=400, detail="Google sign-in could not be verified for this app.")
 
-        email = token_data.get("email")
+        email = _normalize_email(token_data.get("email"))
         if not email:
             raise HTTPException(status_code=400, detail="Google did not provide an email address.")
 
@@ -3773,7 +3804,7 @@ async def google_auth(payload: GoogleAuthRequest):
     else:
         raise HTTPException(status_code=400, detail="Google sign-in token missing. Please try again.")
 
-    existing_user = await db["users"].find_one({"email": email})
+    existing_user = await db["users"].find_one(_email_lookup_filter(email))
     if not existing_user:
         new_user = {
             "username": username,
@@ -3794,13 +3825,15 @@ async def google_auth(payload: GoogleAuthRequest):
             patch["google_id"] = google_id
         if not existing_user.get("username"):
             patch["username"] = username
-        await db["users"].update_one({"email": email}, {"$set": patch})
+        if _normalize_email(existing_user.get("email")) != email:
+            patch["email"] = email
+        await db["users"].update_one({"_id": existing_user["_id"]}, {"$set": patch})
         await record_auth_event(email, "google_login", "google", username)
-        existing_user = await db["users"].find_one({"email": email})
+        existing_user = await db["users"].find_one({"_id": existing_user["_id"]})
         username = existing_user.get("username") or username
 
     token = create_access_token({"email": email})
-    user_doc = await db["users"].find_one({"email": email})
+    user_doc = await db["users"].find_one(_email_lookup_filter(email))
     return _auth_response(user_doc, token)
 
 
@@ -3840,8 +3873,8 @@ def _auth_response(user_doc: dict, token: str) -> dict:
 
 @app.get("/me")
 async def get_profile(user=Depends(get_current_user)):
-    email = user.get("email")
-    existing = await db["users"].find_one({"email": email})
+    email = _normalize_email(user.get("email"))
+    existing = await db["users"].find_one(_email_lookup_filter(email))
     if not existing:
         raise HTTPException(status_code=404, detail="User profile not found.")
     return _serialize_user(existing)
@@ -3849,8 +3882,8 @@ async def get_profile(user=Depends(get_current_user)):
 
 @app.put("/me")
 async def update_profile(payload: ProfileUpdate, user=Depends(get_current_user)):
-    email = user.get("email")
-    existing = await db["users"].find_one({"email": email})
+    email = _normalize_email(user.get("email"))
+    existing = await db["users"].find_one(_email_lookup_filter(email))
     if not existing:
         raise HTTPException(status_code=404, detail="User profile not found.")
 
@@ -3869,8 +3902,8 @@ async def update_profile(payload: ProfileUpdate, user=Depends(get_current_user))
     if not updates:
         raise HTTPException(status_code=400, detail="No profile changes were provided.")
 
-    await db["users"].update_one({"email": email}, {"$set": updates})
-    refreshed = await db["users"].find_one({"email": email})
+    await db["users"].update_one({"_id": existing["_id"]}, {"$set": updates})
+    refreshed = await db["users"].find_one({"_id": existing["_id"]})
     return {"status": "success", "user": _serialize_user(refreshed)}
 
 
@@ -3902,7 +3935,7 @@ async def login_user(user: UserLogin):
 async def login_user_safe(user: UserLogin):
     try:
         email = user.email.strip().lower()
-        existing_user = await db["users"].find_one({"email": email})
+        existing_user = await db["users"].find_one(_email_lookup_filter(email))
 
         if not existing_user:
             raise HTTPException(status_code=400, detail="We couldn't find an account with that email. Please register first.")
@@ -3928,7 +3961,7 @@ async def login_user_safe(user: UserLogin):
             existing_user.get("auth_provider") or "email",
             existing_user.get("username") or "",
         )
-        existing_user = await db["users"].find_one({"email": email})
+        existing_user = await db["users"].find_one(_email_lookup_filter(email))
         return _auth_response(existing_user, token)
     except HTTPException:
         raise
@@ -3991,15 +4024,17 @@ async def admin_users(
             query = activity_filter
 
     rows = []
-    async for doc in db["users"].find(query).sort([("created_at", -1), ("last_login_at", -1)]):
+    async for doc in db["users"].find(query).sort([("created_at", -1), ("last_login_at", -1), ("_id", -1)]):
         user_email = doc.get("email") or ""
-        chat_count = await db.chat_history.count_documents({"user_email": user_email})
+        chat_count = await db.chat_history.count_documents({
+            "user_email": {"$regex": f"^{re.escape(user_email)}$", "$options": "i"},
+        })
         profile = _serialize_user(doc)
         profile["chat_count"] = chat_count
         profile["created_at"] = _format_admin_datetime(profile.get("created_at"))
         profile["last_login_at"] = _format_admin_datetime(profile.get("last_login_at"))
         rows.append(profile)
-    return {"users": rows}
+    return {"users": rows, "count": len(rows)}
 
 
 @app.get("/admin/logins")
