@@ -19,8 +19,18 @@ function formatEventLabel(event) {
     login: "Login",
     google_register: "Google sign up",
     google_login: "Google login",
+    chat_recovered: "Recovered from chat",
   };
   return labels[event] || event || "—";
+}
+
+function formatActivityType(type) {
+  const labels = {
+    registered: "Registered",
+    guest: "Guest (no sign-up)",
+    chat_only: "Chat only (recovered)",
+  };
+  return labels[type] || type || "—";
 }
 
 const DeleteIcon = () => (
@@ -47,6 +57,7 @@ export default function AdminDashboard() {
   const [overview, setOverview] = useState(null);
   const [users, setUsers] = useState([]);
   const [logins, setLogins] = useState([]);
+  const [activity, setActivity] = useState([]);
   const [chats, setChats] = useState([]);
   const [tab, setTab] = useState("users");
   const [searchEmail, setSearchEmail] = useState("");
@@ -84,6 +95,7 @@ export default function AdminDashboard() {
     const userQuery = buildQuery(emailQuery, "", { includePeriod: false });
     const chatQuery = buildQuery(emailQuery, "limit=200");
     const loginQuery = buildQuery(emailQuery, "limit=300");
+    const activityQuery = buildQuery(emailQuery, "limit=500");
 
     setLoading(true);
     setError("");
@@ -107,6 +119,7 @@ export default function AdminDashboard() {
 
       const optionalLoads = await Promise.allSettled([
         apiRequest(`/admin/logins${loginQuery}`, { token }),
+        apiRequest(`/admin/activity${activityQuery}`, { token }),
         apiRequest(`/admin/chats${chatQuery}`, { token }),
       ]);
 
@@ -118,7 +131,13 @@ export default function AdminDashboard() {
       }
 
       if (optionalLoads[1].status === "fulfilled") {
-        setChats(Array.isArray(optionalLoads[1].value?.chats) ? optionalLoads[1].value.chats : []);
+        setActivity(Array.isArray(optionalLoads[1].value?.activity) ? optionalLoads[1].value.activity : []);
+      } else {
+        setActivity([]);
+      }
+
+      if (optionalLoads[2].status === "fulfilled") {
+        setChats(Array.isArray(optionalLoads[2].value?.chats) ? optionalLoads[2].value.chats : []);
       } else {
         setChats([]);
       }
@@ -127,6 +146,7 @@ export default function AdminDashboard() {
       setOverview(null);
       setUsers([]);
       setLogins([]);
+      setActivity([]);
       setChats([]);
     } finally {
       setLoading(false);
@@ -239,8 +259,8 @@ export default function AdminDashboard() {
           </p>
         ) : (
           <p className="admin-search-hint">
-            <strong>Users</strong> loads directly from MongoDB ({overview?.database || "ai_project"}).
-            Showing {users.length} of {overview?.total_users ?? users.length} registered accounts.
+            <strong>Users</strong> = registered accounts in MongoDB. <strong>All Activity</strong> includes guests who chatted without sign-up.
+            DB: {overview?.database || "ai_project"} · {overview?.total_users ?? users.length} registered · {overview?.guest_sessions ?? 0} guest sessions
           </p>
         )}
       </div>
@@ -273,8 +293,20 @@ export default function AdminDashboard() {
               <strong>{overview.total_chats}</strong>
             </article>
             <article className="admin-stat-card">
-              <span>Google users</span>
-              <strong>{overview.google_users}</strong>
+              <span>Guest sessions</span>
+              <strong>{overview.guest_sessions ?? 0}</strong>
+            </article>
+            <article className="admin-stat-card">
+              <span>Login events</span>
+              <strong>{overview.login_events_total ?? logins.length}</strong>
+            </article>
+            <article className="admin-stat-card">
+              <span>RAG chunks</span>
+              <strong>{overview.rag_chunks ?? 0}</strong>
+            </article>
+            <article className="admin-stat-card">
+              <span>Vector search</span>
+              <strong>{overview.vector_search_enabled ? "On" : "Off"}</strong>
             </article>
           </section>
 
@@ -282,8 +314,11 @@ export default function AdminDashboard() {
             <button type="button" className={tab === "users" ? "active" : ""} onClick={() => setTab("users")}>
               Users ({overview?.total_users ?? users.length})
             </button>
+            <button type="button" className={tab === "activity" ? "active" : ""} onClick={() => setTab("activity")}>
+              All Activity ({activity.length})
+            </button>
             <button type="button" className={tab === "logins" ? "active" : ""} onClick={() => setTab("logins")}>
-              Logins ({logins.length})
+              Logins ({overview?.login_events_total ?? logins.length})
             </button>
             <button type="button" className={tab === "chats" ? "active" : ""} onClick={() => setTab("chats")}>
               Chats ({chats.length})
@@ -335,6 +370,41 @@ export default function AdminDashboard() {
                               <span className="admin-protected" title="Protected account">—</span>
                             )}
                           </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </section>
+          )}
+
+          {tab === "activity" && (
+            <section className="admin-panel">
+              {activity.length === 0 ? (
+                <p className="admin-empty">No chat activity found in MongoDB for this filter.</p>
+              ) : (
+                <div className="admin-table-wrap">
+                  <table className="admin-table">
+                    <thead>
+                      <tr>
+                        <th>Type</th>
+                        <th>Identity / Email</th>
+                        <th>Chats</th>
+                        <th>First seen</th>
+                        <th>Last seen</th>
+                        <th>Registered</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {activity.map((row) => (
+                        <tr key={row.identity}>
+                          <td>{formatActivityType(row.type)}</td>
+                          <td>{row.email || row.identity}</td>
+                          <td>{row.chat_count ?? 0}</td>
+                          <td>{formatWhen(row.first_seen)}</td>
+                          <td>{formatWhen(row.last_seen)}</td>
+                          <td>{row.registered ? "Yes" : "No"}</td>
                         </tr>
                       ))}
                     </tbody>

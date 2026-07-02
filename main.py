@@ -152,6 +152,7 @@ async def lifespan(app: FastAPI):
         await ensure_admin_user()
         await _ensure_admin_indexes()
         await _backfill_auth_history()
+        await _recover_users_from_chat_history()
         user_count = await db["users"].count_documents({})
         login_count = await db.login_events.count_documents({})
         print(f"ADMIN: MongoDB database '{MONGODB_DB_NAME}' — {user_count} users, {login_count} login events")
@@ -2348,6 +2349,105 @@ async def _chat_counts_by_email() -> dict:
     return counts
 
 
+async def _chat_activity_rows(limit: int = 500) -> list:
+    """All chat identities from MongoDB — registered emails, guests, and recovered."""
+    registered = set()
+    async for doc in db["users"].find({}, {"email": 1}):
+        email = _normalize_email(doc.get("email"))
+        if email:
+            registered.add(email)
+
+    pipeline = [
+        {"$match": {"user_email": {"$exists": True, "$type": "string", "$ne": ""}}},
+        {
+            "$group": {
+                "_id": "$user_email",
+                "chat_count": {"$sum": 1},
+                "first_seen": {"$min": "$timestamp"},
+                "last_seen": {"$max": "$timestamp"},
+            }
+        },
+        {"$sort": {"last_seen": -1}},
+        {"$limit": max(1, min(limit, 1000))},
+    ]
+
+    rows = []
+    async for row in db.chat_history.aggregate(pipeline):
+        identity = row.get("_id") or ""
+        is_guest = str(identity).lower().startswith("guest:")
+        email_key = _normalize_email(identity) if not is_guest and "@" in identity else ""
+        rows.append({
+            "identity": identity,
+            "email": email_key or None,
+            "type": "guest" if is_guest else ("registered" if email_key in registered else "chat_only"),
+            "chat_count": row.get("chat_count") or 0,
+            "first_seen": _format_admin_datetime(row.get("first_seen")),
+            "last_seen": _format_admin_datetime(row.get("last_seen")),
+            "registered": email_key in registered if email_key else False,
+        })
+    return rows
+
+
+async def _recover_users_from_chat_history():
+    """Create user + login records for real emails found in chat_history but missing from users."""
+    registered = set()
+    async for doc in db["users"].find({}, {"email": 1}):
+        email = _normalize_email(doc.get("email"))
+        if email:
+            registered.add(email)
+
+    pipeline = [
+        {"$match": {"user_email": {"$exists": True, "$type": "string", "$ne": ""}}},
+        {"$project": {"email_key": {"$toLower": "$user_email"}}},
+        {"$match": {
+            "$and": [
+                {"email_key": {"$regex": "@"}},
+                {"email_key": {"$not": {"$regex": "^guest:"}}},
+            ]
+        }},
+        {
+            "$group": {
+                "_id": "$email_key",
+                "first_seen": {"$min": "$timestamp"},
+                "last_seen": {"$max": "$timestamp"},
+                "chat_count": {"$sum": 1},
+            }
+        },
+    ]
+
+    recovered = 0
+    async for row in db.chat_history.aggregate(pipeline):
+        email = row.get("_id") or ""
+        if not email or email in registered:
+            continue
+        first_seen = row.get("first_seen") or datetime.utcnow()
+        last_seen = row.get("last_seen") or first_seen
+        username = email.split("@")[0]
+        await db["users"].insert_one({
+            "username": username,
+            "email": email,
+            "password": None,
+            "auth_provider": "recovered_from_chat",
+            "created_at": first_seen,
+            "last_login_at": last_seen,
+            "login_count": 0,
+            "recovered_from_chat": True,
+            "chat_count_at_recovery": row.get("chat_count") or 0,
+        })
+        await db.login_events.insert_one({
+            "email": email,
+            "username": username,
+            "event": "chat_recovered",
+            "auth_provider": "recovered_from_chat",
+            "created_at": first_seen,
+        })
+        registered.add(email)
+        recovered += 1
+
+    if recovered:
+        print(f"ADMIN: Recovered {recovered} user(s) from chat_history")
+
+
 def _utc_day_bounds(days_ago: int = 0):
     """UTC midnight window. days_ago=0 today, 1 yesterday."""
     now = datetime.utcnow()
@@ -4011,6 +4111,17 @@ async def admin_overview(_admin=Depends(require_admin)):
     logins_today = await db.login_events.count_documents({"created_at": {"$gte": t_start, "$lt": t_end}})
     logins_yesterday = await db.login_events.count_documents({"created_at": {"$gte": y_start, "$lt": y_end}})
 
+    all_chat_emails = await db.chat_history.distinct("user_email")
+    guest_sessions = sum(1 for e in all_chat_emails if e and str(e).startswith("guest:"))
+    collection_names = await db.list_collection_names()
+    rag_chunks = await db.rag_chunks.count_documents({}) if "rag_chunks" in collection_names else 0
+    vector_index_active = False
+    try:
+        indexes = await db.chat_history.list_search_indexes().to_list(length=10)
+        vector_index_active = any((idx.get("status") or "").lower() == "ready" for idx in indexes)
+    except Exception:
+        vector_index_active = False
+
     return {
         "total_users": total_users,
         "total_chats": total_chats,
@@ -4021,6 +4132,11 @@ async def admin_overview(_admin=Depends(require_admin)):
         "logins_today": logins_today,
         "logins_yesterday": logins_yesterday,
         "database": MONGODB_DB_NAME,
+        "guest_sessions": guest_sessions,
+        "login_events_total": await db.login_events.count_documents({}),
+        "rag_chunks": rag_chunks,
+        "vector_search_enabled": vector_index_active,
+        "mongodb_connected": True,
     }
 
 
@@ -4095,6 +4211,41 @@ async def admin_logins(
             "created_at": _format_admin_datetime(doc.get("created_at")),
         })
     return {"logins": rows, "count": len(rows)}
+
+
+@app.get("/admin/activity")
+async def admin_activity(
+    email: Optional[str] = None,
+    period: Optional[str] = None,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+    limit: int = 300,
+    _admin=Depends(require_admin),
+):
+    """Every chat identity in MongoDB — registered users, guests, and chat-only emails."""
+    rows = await _chat_activity_rows(limit=max(1, min(limit, 1000)))
+    if email and email.strip():
+        needle = email.strip().lower()
+        rows = [r for r in rows if needle in (r.get("identity") or "").lower() or needle in (r.get("email") or "").lower()]
+    date_filter = _admin_date_filter(period, since, until, "last_seen")
+    if date_filter.get("last_seen"):
+        rng = date_filter["last_seen"]
+        filtered = []
+        for row in rows:
+            last_seen = row.get("last_seen")
+            if not last_seen:
+                continue
+            try:
+                dt = datetime.fromisoformat(str(last_seen).replace("Z", ""))
+            except ValueError:
+                continue
+            if rng.get("$gte") and dt < rng["$gte"]:
+                continue
+            if rng.get("$lt") and dt >= rng["$lt"]:
+                continue
+            filtered.append(row)
+        rows = filtered
+    return {"activity": rows, "count": len(rows), "database": MONGODB_DB_NAME}
 
 
 @app.delete("/admin/users")
