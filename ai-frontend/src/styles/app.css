@@ -1914,6 +1914,12 @@ button, input, textarea { font: inherit; }
   background: rgba(185, 28, 28, 0.08);
 }
 
+.admin-warning {
+  color: #b45309;
+  border-color: rgba(180, 83, 9, 0.25);
+  background: rgba(180, 83, 9, 0.08);
+}
+
 .admin-table-wrap {
   overflow-x: auto;
 }

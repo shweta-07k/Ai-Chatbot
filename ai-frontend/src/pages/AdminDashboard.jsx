@@ -40,9 +40,10 @@ const PERIOD_OPTIONS = [
 ];
 
 export default function AdminDashboard() {
-  const { user, isAuthenticated } = useAuth();
+  const { user, isAuthenticated, refreshProfile } = useAuth();
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [warning, setWarning] = useState("");
   const [overview, setOverview] = useState(null);
   const [users, setUsers] = useState([]);
   const [logins, setLogins] = useState([]);
@@ -74,48 +75,77 @@ export default function AdminDashboard() {
 
   const loadAdminData = useCallback(async (emailQuery = "") => {
     const token = getAuthToken();
+    if (!token) {
+      setError("Please sign in again as admin.");
+      setLoading(false);
+      return;
+    }
+
     const userQuery = buildQuery(emailQuery, "", { includePeriod: false });
     const chatQuery = buildQuery(emailQuery, "limit=200");
     const loginQuery = buildQuery(emailQuery, "limit=300");
 
     setLoading(true);
     setError("");
-    const partialErrors = [];
+    setWarning("");
 
-    const safeRequest = async (path, fallback) => {
-      try {
-        return await apiRequest(path, { token });
-      } catch (err) {
-        partialErrors.push(friendlyChatError(err));
-        return fallback;
+    try {
+      const [stats, userRows] = await Promise.all([
+        apiRequest("/admin/overview", { token }),
+        apiRequest(`/admin/users${userQuery}`, { token }),
+      ]);
+
+      setOverview(stats);
+      const loadedUsers = Array.isArray(userRows?.users) ? userRows.users : [];
+      setUsers(loadedUsers);
+
+      if (stats?.total_users != null && loadedUsers.length !== stats.total_users) {
+        setWarning(
+          `Database has ${stats.total_users} users but loaded ${loadedUsers.length}. Click Refresh or sign in again.`
+        );
       }
-    };
 
-    const [stats, userRows, loginRows, chatRows] = await Promise.all([
-      safeRequest("/admin/overview", null),
-      safeRequest(`/admin/users${userQuery}`, { users: [], count: 0 }),
-      safeRequest(`/admin/logins${loginQuery}`, { logins: [], count: 0 }),
-      safeRequest(`/admin/chats${chatQuery}`, { chats: [] }),
-    ]);
+      const optionalLoads = await Promise.allSettled([
+        apiRequest(`/admin/logins${loginQuery}`, { token }),
+        apiRequest(`/admin/chats${chatQuery}`, { token }),
+      ]);
 
-    if (stats) setOverview(stats);
-    setUsers(Array.isArray(userRows?.users) ? userRows.users : []);
-    setLogins(Array.isArray(loginRows?.logins) ? loginRows.logins : []);
-    setChats(Array.isArray(chatRows?.chats) ? chatRows.chats : []);
+      if (optionalLoads[0].status === "fulfilled") {
+        setLogins(Array.isArray(optionalLoads[0].value?.logins) ? optionalLoads[0].value.logins : []);
+      } else {
+        setLogins([]);
+        setWarning((prev) => prev || friendlyChatError(optionalLoads[0].reason));
+      }
 
-    if (!stats && userRows.users.length === 0) {
-      setError(partialErrors[0] || "Could not load admin dashboard.");
-    } else if (partialErrors.length) {
-      setError(partialErrors.join(" "));
+      if (optionalLoads[1].status === "fulfilled") {
+        setChats(Array.isArray(optionalLoads[1].value?.chats) ? optionalLoads[1].value.chats : []);
+      } else {
+        setChats([]);
+      }
+    } catch (err) {
+      setError(friendlyChatError(err));
+      setOverview(null);
+      setUsers([]);
+      setLogins([]);
+      setChats([]);
+    } finally {
+      setLoading(false);
     }
-
-    setLoading(false);
   }, [buildQuery]);
 
   useEffect(() => {
     if (!isAuthenticated || !user?.is_admin) return;
-    loadAdminData(debouncedSearch);
-  }, [isAuthenticated, user?.is_admin, debouncedSearch, period, loadAdminData]);
+    let cancelled = false;
+    (async () => {
+      try {
+        await refreshProfile();
+      } catch {
+        // loadAdminData will surface auth errors
+      }
+      if (!cancelled) loadAdminData(debouncedSearch);
+    })();
+    return () => { cancelled = true; };
+  }, [isAuthenticated, user?.is_admin, debouncedSearch, period, loadAdminData, refreshProfile]);
 
   const handleRefresh = () => loadAdminData(debouncedSearch);
 
@@ -209,13 +239,15 @@ export default function AdminDashboard() {
           </p>
         ) : (
           <p className="admin-search-hint">
-            <strong>Users</strong> lists every account (email + Google). <strong>Time period</strong> filters Logins and Chats only.
+            <strong>Users</strong> loads directly from MongoDB ({overview?.database || "ai_project"}).
+            Showing {users.length} of {overview?.total_users ?? users.length} registered accounts.
           </p>
         )}
       </div>
 
       {loading && <div className="admin-panel">Loading admin data...</div>}
       {error && <div className="admin-panel admin-error">{error}</div>}
+      {warning && !error && <div className="admin-panel admin-warning">{warning}</div>}
 
       {!loading && !error && overview && (
         <>

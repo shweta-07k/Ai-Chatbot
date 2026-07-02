@@ -110,7 +110,8 @@ db_client = AsyncIOMotorClient(
     connectTimeoutMS=5000,
     socketTimeoutMS=10000,
 )
-db = db_client.ai_project
+MONGODB_DB_NAME = (os.getenv("MONGODB_DB_NAME") or "ai_project").strip()
+db = db_client[MONGODB_DB_NAME]
 
 http_session = requests.Session()
 http_session.trust_env = False  # Ignore broken proxy env vars that can block live API calls
@@ -151,6 +152,9 @@ async def lifespan(app: FastAPI):
         await ensure_admin_user()
         await _ensure_admin_indexes()
         await _backfill_auth_history()
+        user_count = await db["users"].count_documents({})
+        login_count = await db.login_events.count_documents({})
+        print(f"ADMIN: MongoDB database '{MONGODB_DB_NAME}' — {user_count} users, {login_count} login events")
     except Exception as exc:
         print("ADMIN SEED WARNING:", exc)
     yield
@@ -2325,9 +2329,23 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
 
 
 def require_admin(user=Depends(get_current_user)):
-    if not _is_admin_email(user.get("email")):
+    if not _is_admin_email(_normalize_email(user.get("email"))):
         raise HTTPException(status_code=403, detail="Admin access required.")
     return user
+
+
+async def _chat_counts_by_email() -> dict:
+    """Count chats per registered email (case-insensitive)."""
+    counts: dict = {}
+    pipeline = [
+        {"$match": {"user_email": {"$exists": True, "$type": "string", "$ne": ""}}},
+        {"$project": {"email_key": {"$toLower": "$user_email"}}},
+        {"$match": {"email_key": {"$not": {"$regex": "^guest:"}}}},
+        {"$group": {"_id": "$email_key", "count": {"$sum": 1}}},
+    ]
+    async for row in db.chat_history.aggregate(pipeline):
+        counts[row.get("_id") or ""] = row.get("count") or 0
+    return counts
 
 
 def _utc_day_bounds(days_ago: int = 0):
@@ -4002,6 +4020,7 @@ async def admin_overview(_admin=Depends(require_admin)):
         "registrations_yesterday": registrations_yesterday,
         "logins_today": logins_today,
         "logins_yesterday": logins_yesterday,
+        "database": MONGODB_DB_NAME,
     }
 
 
@@ -4013,28 +4032,40 @@ async def admin_users(
     until: Optional[str] = None,
     _admin=Depends(require_admin),
 ):
-    query = {}
-    if email and email.strip():
-        query["email"] = {"$regex": re.escape(email.strip()), "$options": "i"}
-    activity_filter = _admin_user_activity_filter(period, since, until)
-    if activity_filter:
-        if query:
-            query = {"$and": [query, activity_filter]}
-        else:
-            query = activity_filter
+    try:
+        query = {}
+        if email and email.strip():
+            query["email"] = {"$regex": re.escape(email.strip()), "$options": "i"}
+        activity_filter = _admin_user_activity_filter(period, since, until)
+        if activity_filter:
+            if query:
+                query = {"$and": [query, activity_filter]}
+            else:
+                query = activity_filter
 
-    rows = []
-    async for doc in db["users"].find(query).sort([("created_at", -1), ("last_login_at", -1), ("_id", -1)]):
-        user_email = doc.get("email") or ""
-        chat_count = await db.chat_history.count_documents({
-            "user_email": {"$regex": f"^{re.escape(user_email)}$", "$options": "i"},
-        })
-        profile = _serialize_user(doc)
-        profile["chat_count"] = chat_count
-        profile["created_at"] = _format_admin_datetime(profile.get("created_at"))
-        profile["last_login_at"] = _format_admin_datetime(profile.get("last_login_at"))
-        rows.append(profile)
-    return {"users": rows, "count": len(rows)}
+        user_docs = await db["users"].find(query).sort(
+            [("created_at", -1), ("last_login_at", -1), ("_id", -1)]
+        ).to_list(length=2000)
+        chat_counts = await _chat_counts_by_email()
+
+        rows = []
+        for doc in user_docs:
+            try:
+                profile = _serialize_user(doc)
+                email_key = _normalize_email(profile.get("email"))
+                profile["chat_count"] = chat_counts.get(email_key, 0)
+                profile["created_at"] = _format_admin_datetime(profile.get("created_at"))
+                profile["last_login_at"] = _format_admin_datetime(profile.get("last_login_at"))
+                rows.append(profile)
+            except Exception as exc:
+                print(f"ADMIN USER SERIALIZE ERROR ({doc.get('email')}):", exc)
+
+        return {"users": rows, "count": len(rows), "database": MONGODB_DB_NAME}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        print("ADMIN USERS ERROR:", exc)
+        raise HTTPException(status_code=500, detail=f"Could not load users from database: {exc}")
 
 
 @app.get("/admin/logins")
